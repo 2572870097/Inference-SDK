@@ -1,0 +1,768 @@
+"""
+PI0 (Vision-Language-Action) Inference Engine.
+
+Uses the SparkMind / LeRobot-compatible PI0 flow-matching policy for
+language-conditioned robot control.
+
+Implements action queue based inference:
+- Predicts chunk_size actions at once using flow matching denoising
+- Maintains action queue for smooth execution
+- Async prefetch and gripper smoothing via BaseInferenceEngine
+"""
+
+import json
+import logging
+import os
+from contextlib import contextmanager
+from dataclasses import fields
+from pathlib import Path
+from typing import Any, Dict, Iterator, Optional, Tuple
+
+import cv2
+import numpy as np
+import torch
+import yaml
+
+from ..base import BaseInferenceEngine, SmoothingConfig
+from ..device import resolve_torch_device
+from ..runtime import iter_model_search_roots, iter_unique_paths
+
+logger = logging.getLogger(__name__)
+
+try:
+    from safetensors.torch import load_file as load_safetensors_file
+except ImportError:
+    load_safetensors_file = None
+
+
+LEGACY_CHECKPOINT_FILES = ("inference_config.yaml", "model.pth", "stats.json")
+PRETRAINED_CHECKPOINT_FILES = ("config.json", "model.safetensors")
+PRETRAINED_SUBDIR_NAME = "pretrained_model"
+PREPROCESSOR_CONFIG_FILENAME = "policy_preprocessor.json"
+POSTPROCESSOR_CONFIG_FILENAME = "policy_postprocessor.json"
+DEFAULT_PI0_TOKENIZER = "google/paligemma2-3b-mix-224"
+PI0_TOKENIZER_ALIASES = {
+    "google/paligemma-3b-pt-224": DEFAULT_PI0_TOKENIZER,
+}
+HF_PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+
+
+def _has_required_files(path: Path, filenames: tuple[str, ...]) -> bool:
+    return path.is_dir() and all((path / name).is_file() for name in filenames)
+
+
+def _is_legacy_pi0_checkpoint(path: Path) -> bool:
+    return _has_required_files(path, LEGACY_CHECKPOINT_FILES)
+
+
+def _is_pretrained_pi0_dir(path: Path) -> bool:
+    return (
+        _has_required_files(path, PRETRAINED_CHECKPOINT_FILES)
+        and (
+            (path / PREPROCESSOR_CONFIG_FILENAME).is_file()
+            or (path / POSTPROCESSOR_CONFIG_FILENAME).is_file()
+        )
+    )
+
+
+def _resolve_pi0_checkpoint_dir(checkpoint_dir: str) -> Path:
+    path = Path(checkpoint_dir)
+    if _is_pretrained_pi0_dir(path):
+        return path
+
+    pretrained_dir = path / PRETRAINED_SUBDIR_NAME
+    if _is_pretrained_pi0_dir(pretrained_dir):
+        return pretrained_dir
+
+    return path
+
+
+def _convert_pretrained_pi0_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    input_features = config_dict.get("input_features") or {}
+    output_features = config_dict.get("output_features") or {}
+
+    robot_state_feature = None
+    env_state_feature = None
+    image_features = []
+
+    for key, feature in input_features.items():
+        feature_type = str(feature.get("type", "")).upper()
+        if key == "observation.state" and feature_type == "STATE":
+            robot_state_feature = feature
+        elif feature_type == "VISUAL":
+            image_features.append(key)
+        elif feature_type == "ENV":
+            env_state_feature = feature
+
+    action_feature = None
+    for key, feature in output_features.items():
+        feature_type = str(feature.get("type", "")).upper()
+        if key == "action" or feature_type == "ACTION":
+            action_feature = feature
+            break
+
+    if robot_state_feature is None:
+        raise ValueError("导出模型缺少 observation.state 输入定义")
+    if action_feature is None:
+        raise ValueError("导出模型缺少 action 输出定义")
+
+    inference_config = dict(config_dict)
+    inference_config["robot_state_feature"] = robot_state_feature
+    inference_config["env_state_feature"] = env_state_feature
+    inference_config["action_feature"] = action_feature
+    inference_config["image_features"] = image_features
+
+    return inference_config
+
+
+def _extract_stats_from_safetensors(state_path: Path) -> Dict[str, Dict[str, Any]]:
+    if load_safetensors_file is None:
+        raise RuntimeError("缺少 safetensors 依赖，无法读取导出模型统计")
+
+    state_dict = load_safetensors_file(str(state_path), device="cpu")
+    stats: Dict[str, Dict[str, Any]] = {}
+
+    for key, value in state_dict.items():
+        if not (key.endswith(".mean") or key.endswith(".std")):
+            continue
+        feature_name, stat_name = key.rsplit(".", 1)
+        stats.setdefault(feature_name, {})[stat_name] = value.cpu().tolist()
+
+    return stats
+
+
+def _load_pretrained_pi0_stats(checkpoint_path: Path) -> Dict[str, Dict[str, Any]]:
+    stats: Dict[str, Dict[str, Any]] = {}
+
+    for config_name in (PREPROCESSOR_CONFIG_FILENAME, POSTPROCESSOR_CONFIG_FILENAME):
+        config_path = checkpoint_path / config_name
+        if not config_path.is_file():
+            continue
+
+        with open(config_path, "r") as f:
+            processor_config = json.load(f)
+
+        for step in processor_config.get("steps", []):
+            state_file = step.get("state_file")
+            if not state_file:
+                continue
+
+            state_path = checkpoint_path / state_file
+            if not state_path.is_file():
+                raise FileNotFoundError(f"处理器状态文件不存在: {state_path}")
+
+            step_stats = _extract_stats_from_safetensors(state_path)
+            for feature_name, feature_stats in step_stats.items():
+                stats.setdefault(feature_name, {}).update(feature_stats)
+
+    if not stats:
+        raise FileNotFoundError("导出模型缺少可用的预处理/后处理统计")
+
+    return stats
+
+
+def _load_pi0_state_dict(checkpoint_path: Path, device: torch.device) -> Dict[str, torch.Tensor]:
+    safetensors_path = checkpoint_path / "model.safetensors"
+    if safetensors_path.is_file():
+        if load_safetensors_file is None:
+            raise RuntimeError("缺少 safetensors 依赖，无法读取 model.safetensors")
+
+        try:
+            return load_safetensors_file(str(safetensors_path), device=str(device))
+        except Exception:
+            return load_safetensors_file(str(safetensors_path), device="cpu")
+
+    model_path = checkpoint_path / "model.pth"
+    try:
+        return torch.load(model_path, map_location=device, weights_only=True)
+    except TypeError:
+        return torch.load(model_path, map_location=device)
+
+
+def _is_local_model_dir(path: Path) -> bool:
+    return path.is_dir() and (
+        (path / "tokenizer_config.json").is_file()
+        or (path / "tokenizer.json").is_file()
+        or (path / "config.json").is_file()
+    )
+
+
+def _normalize_pi0_tokenizer_name(tokenizer_name: Optional[str]) -> str:
+    if not isinstance(tokenizer_name, str):
+        return DEFAULT_PI0_TOKENIZER
+
+    normalized = tokenizer_name.strip()
+    if not normalized:
+        return DEFAULT_PI0_TOKENIZER
+
+    aliased = PI0_TOKENIZER_ALIASES.get(normalized)
+    if aliased is not None:
+        logger.info("Remapping legacy PI0 tokenizer %s -> %s", normalized, aliased)
+        return aliased
+
+    return normalized
+
+
+def _candidate_pi0_tokenizer_names(requested_tokenizer: str) -> tuple[str, ...]:
+    candidates = [requested_tokenizer]
+    for legacy_name, canonical_name in PI0_TOKENIZER_ALIASES.items():
+        if canonical_name == requested_tokenizer and legacy_name not in candidates:
+            candidates.append(legacy_name)
+    return tuple(candidates)
+
+
+def _read_pi0_tokenizer_name(checkpoint_path: Path) -> str:
+    preprocessor_path = checkpoint_path / PREPROCESSOR_CONFIG_FILENAME
+    if not preprocessor_path.is_file():
+        return DEFAULT_PI0_TOKENIZER
+
+    try:
+        with open(preprocessor_path, "r") as f:
+            processor_config = json.load(f)
+    except Exception as exc:
+        logger.warning("Failed to read PI0 preprocessor config %s: %s", preprocessor_path, exc)
+        return DEFAULT_PI0_TOKENIZER
+
+    for step in processor_config.get("steps", []):
+        if step.get("registry_name") != "tokenizer_processor":
+            continue
+        tokenizer_name = (step.get("config") or {}).get("tokenizer_name")
+        if isinstance(tokenizer_name, str) and tokenizer_name.strip():
+            return _normalize_pi0_tokenizer_name(tokenizer_name)
+
+    return DEFAULT_PI0_TOKENIZER
+
+
+def _add_relative_model_candidates(candidate_paths: list[Path], base_dir: Path, tokenizer_name: str) -> None:
+    repo_path = Path(*tokenizer_name.split("/"))
+    candidate_paths.extend(
+        [
+            base_dir / repo_path,
+            base_dir / repo_path.name,
+        ]
+    )
+
+
+def _resolve_pi0_tokenizer_source(checkpoint_path: Path, tokenizer_path: Optional[str] = None) -> str:
+    requested_tokenizer = _normalize_pi0_tokenizer_name(_read_pi0_tokenizer_name(checkpoint_path))
+    env_override = os.environ.get("PI0_TOKENIZER_PATH")
+    candidate_paths: list[Path] = []
+
+    for override in (tokenizer_path, env_override):
+        if not override:
+            continue
+        candidate_paths.append(Path(override).expanduser())
+
+    candidate_paths.append(checkpoint_path / "tokenizer")
+
+    for base_dir in iter_model_search_roots(checkpoint_path):
+        for tokenizer_name in _candidate_pi0_tokenizer_names(requested_tokenizer):
+            _add_relative_model_candidates(candidate_paths, base_dir, tokenizer_name)
+
+    for candidate in iter_unique_paths(candidate_paths):
+        if _is_local_model_dir(candidate):
+            logger.info("Using local PI0 tokenizer assets from %s", candidate)
+            return str(candidate)
+
+    return requested_tokenizer
+
+
+@contextmanager
+def _normalized_hf_proxy_env() -> Iterator[None]:
+    """httpx rejects socks:// proxies; normalize them to socks5:// for HF clients."""
+    original_values: Dict[str, str] = {}
+
+    for key in HF_PROXY_ENV_KEYS:
+        value = os.environ.get(key)
+        if isinstance(value, str) and value.startswith("socks://"):
+            original_values[key] = value
+            os.environ[key] = f"socks5://{value[len('socks://'):]}"
+            logger.info("Normalized %s to socks5:// for Hugging Face access", key)
+
+    try:
+        yield
+    finally:
+        for key, value in original_values.items():
+            os.environ[key] = value
+
+
+def _format_pi0_load_error(error: Exception, requested_tokenizer: str) -> str:
+    message = str(error)
+
+    if "Unknown scheme for proxy URL" in message and "socks://" in message:
+        return (
+            "模型加载失败: 检测到无效代理配置。当前 `ALL_PROXY/HTTP_PROXY` 使用了 `socks://`，"
+            "请改成 `socks5://127.0.0.1:7897/`，或者临时取消 `ALL_PROXY` 后重启后端。"
+        )
+
+    if "Can't load tokenizer" in message or "Can't load the tokenizer" in message:
+        return (
+            "模型加载失败: PI0 tokenizer 未就绪。当前需要加载 "
+            f"`{requested_tokenizer}`。如果你要离线推理，请先下载该 tokenizer，例如:\n"
+            f"`source .venv/bin/activate && hf download {requested_tokenizer} "
+            f"--local-dir models/{requested_tokenizer}`\n"
+            "然后任选其一:\n"
+            f"`export PI0_TOKENIZER_PATH=/absolute/path/to/models/{requested_tokenizer}`\n"
+            "`export INFERENCE_SDK_MODEL_ROOTS=/absolute/path/to/models`\n"
+            "或在前端 PI0 模型加载面板里直接填写 Tokenizer 路径。"
+        )
+
+    if (
+        "gated repo" in message.lower()
+        or "Cannot access gated repo" in message
+        or "401 Client Error" in message
+        or ("Access to model " in message and " is restricted" in message)
+    ):
+        return (
+            f"模型加载失败: 当前 PI0 需要的 tokenizer `{requested_tokenizer}` 是 Hugging Face 受限仓库，"
+            "你当前环境既没有本地 tokenizer 文件，也没有可用的 HF 授权。\n"
+            "可选解决方案:\n"
+            "1. 使用有权限的 Hugging Face 账号登录并下载 tokenizer:\n"
+            "`source .venv/bin/activate && hf auth login`\n"
+            f"`hf download {requested_tokenizer} --local-dir models/{requested_tokenizer}`\n"
+            "2. 如果这台机器不方便联网，可在另一台已获授权的机器下载后，把整个目录拷贝到:\n"
+            f"`/absolute/path/to/models/{requested_tokenizer}`\n"
+            "3. 然后任选其一:\n"
+            f"`export PI0_TOKENIZER_PATH=/absolute/path/to/models/{requested_tokenizer}`\n"
+            "`export INFERENCE_SDK_MODEL_ROOTS=/absolute/path/to/models`\n"
+            "或在前端 PI0 模型加载面板里直接填写 Tokenizer 路径。\n"
+            "补充说明: 你当前的 PI0 checkpoint 目录只包含模型权重和 processor/stats，不包含 tokenizer 资产。"
+        )
+
+    if "Operation not permitted" in message:
+        return (
+            "模型加载失败: 当前环境无法访问 Hugging Face。请检查网络/代理，"
+            "或者先把 PI0 tokenizer 下载到本地，并通过 `PI0_TOKENIZER_PATH` 指向它。"
+        )
+
+    return f"模型加载失败: {message}"
+
+
+PI0_AVAILABLE = False
+try:
+    from transformers import AutoTokenizer
+
+    from sparkmind.lerobot_compat.configs.types import FeatureType, NormalizationMode, PolicyFeature
+    from sparkmind.lerobot_compat.policies.pi0.configuration_pi0 import PI0Config
+    from sparkmind.lerobot_compat.policies.pi0.modeling_pi0 import PI0Policy
+    from sparkmind.learning.VLA.models.pi0_model import PI0Pytorch
+
+    PI0_AVAILABLE = True
+    logger.info("SparkMind PI0 model loaded successfully")
+except Exception as e:
+    logger.warning("SparkMind PI0 model not available: %s", e)
+
+
+def _coerce_policy_feature_map(feature_map: Dict[str, Any]) -> Dict[str, Any]:
+    if not PI0_AVAILABLE:
+        return feature_map
+
+    coerced: Dict[str, Any] = {}
+    for key, value in feature_map.items():
+        if isinstance(value, PolicyFeature):
+            coerced[key] = value
+            continue
+        if isinstance(value, dict) and "type" in value and "shape" in value:
+            coerced[key] = PolicyFeature(
+                type=FeatureType(str(value["type"]).upper()),
+                shape=tuple(value["shape"]),
+            )
+        else:
+            coerced[key] = value
+    return coerced
+
+
+def _coerce_pi0_config_dict(config_dict: Dict[str, Any], device: str) -> Dict[str, Any]:
+    if not PI0_AVAILABLE:
+        return config_dict
+
+    accepted_keys = {f.name for f in fields(PI0Config)}
+    filtered_config = {k: v for k, v in config_dict.items() if k in accepted_keys}
+    filtered_config["device"] = device
+
+    if "image_resolution" in filtered_config and isinstance(filtered_config["image_resolution"], list):
+        filtered_config["image_resolution"] = tuple(filtered_config["image_resolution"])
+
+    if "input_features" in filtered_config and isinstance(filtered_config["input_features"], dict):
+        filtered_config["input_features"] = _coerce_policy_feature_map(filtered_config["input_features"])
+
+    if "output_features" in filtered_config and isinstance(filtered_config["output_features"], dict):
+        filtered_config["output_features"] = _coerce_policy_feature_map(filtered_config["output_features"])
+
+    if "normalization_mapping" in filtered_config and isinstance(filtered_config["normalization_mapping"], dict):
+        filtered_config["normalization_mapping"] = {
+            key: value if isinstance(value, NormalizationMode) else NormalizationMode(str(value))
+            for key, value in filtered_config["normalization_mapping"].items()
+        }
+
+    return filtered_config
+
+
+class PI0InferenceEngine(BaseInferenceEngine):
+    """
+    PI0 (Vision-Language-Action) inference engine.
+
+    Uses the PI0 flow-matching model to predict action chunks from images,
+    language instruction and robot state.
+    """
+
+    def __init__(
+        self,
+        device: str = "cuda:0",
+        smoothing_config: Optional[SmoothingConfig] = None,
+        strict_device: bool = False,
+    ):
+        super().__init__(smoothing_config)
+        self.model_type = "pi0"
+
+        device_selection = resolve_torch_device(device, strict=strict_device)
+        self.requested_device = device_selection.requested
+        self.actual_device = device_selection.actual
+        self.device_warning = device_selection.warning
+        if self.device_warning:
+            logger.warning(self.device_warning)
+        self.device = torch.device(self.actual_device)
+
+        self.model: Optional[Any] = None
+        self.config: Optional[Any] = None
+        self.config_dict: Optional[Dict[str, Any]] = None
+        self.stats: Optional[Dict[str, Dict[str, Any]]] = None
+        self.tokenizer: Optional[Any] = None
+        self.tokenizer_source: Optional[str] = None
+
+        self._camera_key_to_role: Dict[str, str] = {}
+        self._role_to_camera_key: Dict[str, str] = {}
+        self._camera_alias_to_key: Dict[str, str] = {}
+
+        self._instruction: str = "Pick up the object."
+        self._instruction_tokens: Optional[torch.Tensor] = None
+        self._instruction_attention_mask: Optional[torch.Tensor] = None
+
+        self._image_resize: Optional[Tuple[int, int]] = (224, 224)
+
+    @staticmethod
+    def validate_checkpoint(checkpoint_dir: str) -> Tuple[bool, str]:
+        """Validate that checkpoint directory contains a supported PI0 checkpoint format."""
+        raw_path = Path(checkpoint_dir)
+        if not raw_path.exists():
+            return False, f"Checkpoint目录不存在: {checkpoint_dir}"
+
+        resolved_path = _resolve_pi0_checkpoint_dir(checkpoint_dir)
+        if _is_legacy_pi0_checkpoint(resolved_path) or _is_pretrained_pi0_dir(resolved_path):
+            return True, ""
+
+        legacy_missing = [name for name in LEGACY_CHECKPOINT_FILES if not (resolved_path / name).is_file()]
+        exported_missing = [name for name in PRETRAINED_CHECKPOINT_FILES if not (resolved_path / name).is_file()]
+        processor_missing = [
+            name
+            for name in (PREPROCESSOR_CONFIG_FILENAME, POSTPROCESSOR_CONFIG_FILENAME)
+            if not (resolved_path / name).is_file()
+        ]
+        return (
+            False,
+            "PI0模型目录格式不受支持。"
+            f" 旧格式需要: {', '.join(LEGACY_CHECKPOINT_FILES)}"
+            f"；导出格式需要: {', '.join(PRETRAINED_CHECKPOINT_FILES)}"
+            f" + 至少一个processor配置({PREPROCESSOR_CONFIG_FILENAME}/{POSTPROCESSOR_CONFIG_FILENAME})"
+            f"。当前缺少 旧格式文件: {', '.join(legacy_missing) or '无'}"
+            f"；导出格式文件: {', '.join(exported_missing) or '无'}"
+            f"；processor配置: {', '.join(processor_missing) or '无'}",
+        )
+
+    def load(self, checkpoint_dir: str, tokenizer_path: Optional[str] = None) -> Tuple[bool, str]:
+        """Load PI0 model from checkpoint."""
+        if not PI0_AVAILABLE:
+            return False, "PI0模型依赖未安装 (SparkMind/transformers)"
+
+        valid, error = self.validate_checkpoint(checkpoint_dir)
+        if not valid:
+            return False, error
+
+        checkpoint_path = _resolve_pi0_checkpoint_dir(checkpoint_dir)
+        tokenizer_source = _resolve_pi0_tokenizer_source(checkpoint_path, tokenizer_path=tokenizer_path)
+        self.tokenizer_source = tokenizer_source
+
+        try:
+            if _is_legacy_pi0_checkpoint(checkpoint_path):
+                config_path = checkpoint_path / "inference_config.yaml"
+                with open(config_path, "r") as f:
+                    self.config_dict = yaml.safe_load(f)
+
+                stats_path = checkpoint_path / "stats.json"
+                with open(stats_path, "r") as f:
+                    self.stats = json.load(f)
+            else:
+                config_path = checkpoint_path / "config.json"
+                with open(config_path, "r") as f:
+                    pretrained_config = json.load(f)
+
+                self.config_dict = _convert_pretrained_pi0_config(pretrained_config)
+                self.stats = _load_pretrained_pi0_stats(checkpoint_path)
+
+            image_features = self.config_dict.get("image_features", [])
+            self.required_cameras = []
+            self._camera_key_to_role = {}
+            self._role_to_camera_key = {}
+            self._camera_alias_to_key = {}
+
+            for key in image_features:
+                if key.startswith("observation.images."):
+                    suffix = key.replace("observation.images.", "")
+                    role = suffix[4:] if suffix.startswith("cam_") else suffix
+                    if role not in self.required_cameras:
+                        self.required_cameras.append(role)
+                    self._camera_key_to_role[key] = role
+                    self._role_to_camera_key[role] = key
+                    self._camera_alias_to_key[role] = key
+                    self._camera_alias_to_key[suffix] = key
+                    self._camera_alias_to_key[key] = key
+
+            state_shape = self.config_dict.get("robot_state_feature", {}).get("shape", [7])
+            action_shape = self.config_dict.get("action_feature", {}).get("shape", [7])
+            self.state_dim = state_shape[0] if state_shape else 7
+            self.action_dim = action_shape[0] if action_shape else 7
+            self.chunk_size = int(self.config_dict.get("chunk_size", 50))
+            self.n_action_steps = int(self.config_dict.get("n_action_steps", self.chunk_size))
+
+            pi0_config_kwargs = _coerce_pi0_config_dict(self.config_dict, str(self.device))
+            self.config = PI0Config(**pi0_config_kwargs)
+            self._image_resize = tuple(self.config.image_resolution) if self.config.image_resolution is not None else None
+
+            with _normalized_hf_proxy_env():
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    tokenizer_source,
+                    trust_remote_code=True,
+                )
+
+            self.model = PI0Pytorch(self.config, rtc_processor=None)
+            self.model.to(self.device)
+            self.model.eval()
+
+            original_state_dict = _load_pi0_state_dict(checkpoint_path, self.device)
+
+            class _PolicyShim:
+                __slots__ = ("model",)
+
+                def __init__(self, model):
+                    self.model = model
+
+            shim = _PolicyShim(self.model)
+            fixed_state_dict = PI0Policy._fix_pytorch_state_dict_keys(shim, original_state_dict, self.model.config)
+            inner_state_dict = {
+                (key[6:] if key.startswith("model.") else key): value
+                for key, value in fixed_state_dict.items()
+            }
+            missing_keys, unexpected_keys = self.model.load_state_dict(inner_state_dict, strict=False)
+
+            self.is_loaded = True
+            self._init_components()
+            self.reset()
+            self._tokenize_instruction(self._instruction)
+
+            logger.info("PI0 model loaded from %s", checkpoint_dir)
+            logger.info("Required cameras: %s", self.required_cameras)
+            logger.info("State dim: %s, Action dim: %s", self.state_dim, self.action_dim)
+            logger.info("Chunk size: %s, N action steps: %s", self.chunk_size, self.n_action_steps)
+            logger.info("Tokenizer: %s", tokenizer_source)
+            logger.info(
+                "PI0 weights loaded with strict=False: missing=%s unexpected=%s",
+                len(missing_keys),
+                len(unexpected_keys),
+            )
+
+            return True, ""
+
+        except Exception as e:
+            logger.error("Failed to load PI0 model: %s", e)
+            import traceback
+
+            traceback.print_exc()
+            return False, _format_pi0_load_error(e, tokenizer_source)
+
+    def set_instruction(self, instruction: str) -> bool:
+        """Set the language instruction for PI0."""
+        if not self.is_loaded or self.tokenizer is None:
+            logger.warning("Cannot set instruction: model not loaded")
+            return False
+
+        self._instruction = instruction
+        self._tokenize_instruction(instruction)
+
+        if self._action_queue is not None:
+            self._action_queue.reset()
+
+        logger.info("Instruction set: %s", instruction)
+        return True
+
+    def get_instruction(self) -> str:
+        """Get current instruction."""
+        return self._instruction
+
+    def _tokenize_instruction(self, instruction: str):
+        """Tokenize instruction for PI0 input."""
+        if self.tokenizer is None:
+            return
+
+        instruction_text = instruction if instruction.endswith("\n") else f"{instruction}\n"
+        tokenizer_max_length = self.config.tokenizer_max_length if self.config is not None else 48
+        self.tokenizer.padding_side = "right"
+
+        tokens = self.tokenizer(
+            instruction_text,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=tokenizer_max_length,
+            truncation=True,
+        )
+        self._instruction_tokens = tokens["input_ids"].to(self.device)
+        self._instruction_attention_mask = tokens["attention_mask"].bool().to(self.device)
+
+    def _resize_with_pad(
+        self,
+        img: np.ndarray,
+        target_h: int,
+        target_w: int,
+        pad_value: int = 0,
+    ) -> np.ndarray:
+        h, w = img.shape[:2]
+        scale = min(target_h / h, target_w / w)
+        new_h, new_w = int(h * scale), int(w * scale)
+
+        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        padded = np.full((target_h, target_w, 3), pad_value, dtype=np.uint8)
+
+        y_offset = (target_h - new_h) // 2
+        x_offset = (target_w - new_w) // 2
+        padded[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+        return padded
+
+    def _preprocess_images(self, images: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
+        """
+        Preprocess images for PI0 input.
+
+        PI0 expects images normalized to [-1, 1] and resized with padding to the
+        configured square resolution.
+        """
+        processed = {}
+
+        for camera_alias, img_bgr in images.items():
+            camera_key = self._camera_alias_to_key.get(camera_alias)
+            if camera_key is None:
+                continue
+
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+            if self._image_resize is not None:
+                target_h, target_w = self._image_resize
+                img_rgb = self._resize_with_pad(img_rgb, target_h, target_w, pad_value=0)
+
+            img_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
+            img_tensor = img_tensor * 2.0 - 1.0
+            img_tensor = img_tensor.unsqueeze(0).to(self.device)
+            processed[camera_key] = img_tensor
+
+        return processed
+
+    def _preprocess_state(self, state: np.ndarray) -> torch.Tensor:
+        """Preprocess robot state for PI0 input."""
+        state = state.copy()
+
+        if len(state) >= 7:
+            state[-1] = state[-1] / 1000.0
+
+        state_tensor = torch.from_numpy(state).float()
+
+        if self.stats is not None and "observation.state" in self.stats:
+            stats = self.stats["observation.state"]
+            mean = torch.tensor(stats["mean"])
+            std = torch.tensor(stats["std"])
+            state_tensor = (state_tensor - mean) / (std + 1e-6)
+
+        return state_tensor.unsqueeze(0).to(self.device)
+
+    def _postprocess_action(self, action_tensor: torch.Tensor) -> np.ndarray:
+        """Postprocess PI0 normalized action tensor back to robot action space."""
+        action = action_tensor.cpu()
+
+        if self.stats is not None and "action" in self.stats:
+            stats = self.stats["action"]
+            mean = torch.tensor(stats["mean"])
+            std = torch.tensor(stats["std"])
+            action = action * std + mean
+
+        action = action.numpy()
+
+        if len(action) >= 7:
+            action[-1] = action[-1] * 1000.0
+
+        return action
+
+    @torch.no_grad()
+    def _predict_chunk(self, images: Dict[str, np.ndarray], state: np.ndarray) -> np.ndarray:
+        """
+        Internal method to predict a chunk of actions using PI0 flow matching.
+
+        Returns:
+            Action chunk (n_action_steps, action_dim) - unnormalized
+        """
+        if self.model is None or self.config is None:
+            raise RuntimeError("Model not loaded")
+
+        if self._instruction_tokens is None or self._instruction_attention_mask is None:
+            raise RuntimeError("Instruction not set - call set_instruction() first")
+
+        processed_images = self._preprocess_images(images)
+        processed_state = self._preprocess_state(state)
+
+        image_features = self.config_dict.get("image_features", [])
+        image_list = [processed_images[key] for key in image_features if key in processed_images]
+        if not image_list:
+            raise RuntimeError("No valid images available for PI0 inference")
+
+        image_masks = [torch.ones(1, dtype=torch.bool, device=self.device) for _ in image_list]
+
+        max_state_dim = self.config.max_state_dim
+        padded_state = torch.zeros(1, max_state_dim, device=self.device)
+        padded_state[0, :processed_state.shape[1]] = processed_state[0]
+
+        actions_chunk = self.model.sample_actions(
+            images=image_list,
+            img_masks=image_masks,
+            lang_tokens=self._instruction_tokens,
+            lang_masks=self._instruction_attention_mask,
+            state=padded_state,
+        )
+
+        actions_normalized = actions_chunk[0, :self.n_action_steps, :self.action_dim]
+        actions = np.stack(
+            [self._postprocess_action(actions_normalized[i]) for i in range(actions_normalized.shape[0])]
+        )
+        return actions
+
+    def unload(self):
+        """Unload model and free memory."""
+        if self.model is not None:
+            del self.model
+            self.model = None
+        if self.tokenizer is not None:
+            del self.tokenizer
+            self.tokenizer = None
+        self.tokenizer_source = None
+
+        self.is_loaded = False
+        self.reset()
+
+        self._instruction_tokens = None
+        self._instruction_attention_mask = None
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        logger.info("PI0 model unloaded")

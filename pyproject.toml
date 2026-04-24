@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inference-sdk"
+version = "0.1.0"
+description = "Standalone inference SDK for ACT, SmolVLA, and PI0 policy inference."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "opencv-python",
+  "PyYAML",
+  "torch",
+]
+
+[project.optional-dependencies]
+act = [
+  "omegaconf",
+  "safetensors",
+]
+examples = [
+  "huggingface_hub",
+  "matplotlib",
+]
+vla = [
+  "omegaconf",
+  "safetensors",
+  "transformers",
+]
+all = [
+  "omegaconf",
+  "safetensors",
+  "transformers",
+  "lerobot",
+]
+
+[tool.setuptools.packages.find]
+include = ["inference_sdk*"]
