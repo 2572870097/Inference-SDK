@@ -687,7 +687,7 @@ class AsyncInferenceWorker:
 
 class BaseInferenceEngine(ABC):
     """
-    Abstract base class for inference engines with LeRobot-style async support.
+    Abstract base class for inference policies with LeRobot-style async support.
     
     Key Features:
     - Timestamp-aligned action queue

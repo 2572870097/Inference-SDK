@@ -1,4 +1,4 @@
-"""Model-specific inference engines."""
+"""Model-specific policy implementations."""
 
 from .act import ACTInferenceEngine, ACT_AVAILABLE
 from .pi0 import PI0InferenceEngine, PI0_AVAILABLE

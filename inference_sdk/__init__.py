@@ -57,7 +57,8 @@ from .base import (  # noqa: E402
     TraceRecorder,
     get_aggregate_function,
 )
-from .engines import (  # noqa: E402
+from .api import InferenceSDK, Observation, PolicyMetadata, predict_action_chunk  # noqa: E402
+from .policy import (  # noqa: E402
     ACT_AVAILABLE,
     PI0_AVAILABLE,
     SMOLVLA_AVAILABLE,
@@ -65,7 +66,12 @@ from .engines import (  # noqa: E402
     PI0InferenceEngine,
     SmolVLAInferenceEngine,
 )
-from .factory import SUPPORTED_MODEL_TYPES, create_engine, create_inference_engine  # noqa: E402
+from .factory import (  # noqa: E402
+    SUPPORTED_MODEL_TYPES,
+    create_engine,
+    create_inference_engine,
+    normalize_model_type,
+)
 
 __all__ = [
     "AGGREGATE_FUNCTIONS",
@@ -82,10 +88,13 @@ __all__ = [
     "DeviceUnavailableError",
     "InferenceRuntimeError",
     "InferenceSDKError",
+    "InferenceSDK",
     "MissingDependencyError",
     "ModelLoadError",
+    "Observation",
     "SmolVLAInferenceEngine",
     "SMOLVLA_AVAILABLE",
+    "PolicyMetadata",
     "SmoothingConfig",
     "SUPPORTED_MODEL_TYPES",
     "TimedAction",
@@ -98,4 +107,6 @@ __all__ = [
     "create_engine",
     "create_inference_engine",
     "get_aggregate_function",
+    "normalize_model_type",
+    "predict_action_chunk",
 ]

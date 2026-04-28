@@ -1,17 +1,37 @@
-"""Factory helpers for creating inference engines."""
+"""Factory helpers for creating inference policies."""
 
 from __future__ import annotations
 
 from typing import Optional
 
 from .base import BaseInferenceEngine, SmoothingConfig
-from .engines import (
+from .policy import (
     ACTInferenceEngine,
     PI0InferenceEngine,
     SmolVLAInferenceEngine,
 )
 
 SUPPORTED_MODEL_TYPES = ("act", "smolvla", "pi0")
+MODEL_TYPE_ALIASES = {
+    "act": "act",
+    "smolvla": "smolvla",
+    "smol_vla": "smolvla",
+    "smol-vla": "smolvla",
+    "pi0": "pi0",
+    "pi_0": "pi0",
+    "pi-0": "pi0",
+}
+
+
+def normalize_model_type(model_type: str) -> str:
+    """Normalize a public model/algorithm type into an SDK model type."""
+    key = str(model_type).strip().lower().replace(" ", "_")
+    try:
+        return MODEL_TYPE_ALIASES[key]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown model type: {model_type}. Supported: {SUPPORTED_MODEL_TYPES}"
+        ) from exc
 
 
 def create_engine(
@@ -35,7 +55,7 @@ def create_engine(
             aggregate_fn_name="latest_only",
         )
 
-    normalized = str(model_type).lower()
+    normalized = normalize_model_type(model_type)
     if normalized == "act":
         return ACTInferenceEngine(
             device=device,
@@ -72,4 +92,10 @@ def create_inference_engine(
     )
 
 
-__all__ = ["SUPPORTED_MODEL_TYPES", "create_engine", "create_inference_engine"]
+__all__ = [
+    "MODEL_TYPE_ALIASES",
+    "SUPPORTED_MODEL_TYPES",
+    "create_engine",
+    "create_inference_engine",
+    "normalize_model_type",
+]
