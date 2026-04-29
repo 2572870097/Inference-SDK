@@ -44,7 +44,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--chunk-size-threshold", type=float, default=0.5)
     parser.add_argument("--aggregate-fn", default="weighted_average")
-    parser.add_argument("--warmup", action="store_true")
+    parser.add_argument(
+        "--fallback-mode",
+        choices=["hold", "repeat"],
+        default="hold",
+        help=(
+            "Action to use when the async queue is empty. "
+            "`hold` sends the current robot state, `repeat` repeats the last action."
+        ),
+    )
+    parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=5.0,
+        help="Seconds to wait for the initial warmup action queue before entering the control loop.",
+    )
+    warmup_group = parser.add_mutually_exclusive_group()
+    warmup_group.add_argument(
+        "--warmup",
+        dest="warmup",
+        action="store_true",
+        default=True,
+        help="Run one synchronous prediction before starting the control loop. Enabled by default.",
+    )
+    warmup_group.add_argument(
+        "--no-warmup",
+        dest="warmup",
+        action="store_false",
+        help="Skip startup warmup. The first control ticks may use fallback actions.",
+    )
     return parser.parse_args()
 
 
@@ -61,6 +89,7 @@ def main() -> None:
             control_fps=args.fps,
             chunk_size_threshold=args.chunk_size_threshold,
             aggregate_fn_name=args.aggregate_fn,
+            fallback_mode=args.fallback_mode,
         ),
     )
 
@@ -72,6 +101,10 @@ def main() -> None:
         )
 
     runtime.start()
+
+    if args.warmup and not runtime.wait_until_ready(min_queue_size=1, timeout=args.startup_timeout):
+        runtime.stop()
+        raise RuntimeError("Async runtime did not produce an initial action before startup timeout.")
 
     try:
         while True:
