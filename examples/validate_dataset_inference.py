@@ -57,7 +57,7 @@ def _ensure_sparkmind_path(repo_root: Path) -> Path:
 
 SPARKMIND_ROOT = _ensure_sparkmind_path(REPO_ROOT)
 
-from inference_sdk import SUPPORTED_MODEL_TYPES, SmoothingConfig, create_engine
+from inference_sdk import AsyncInferenceConfig, AsyncInferenceRuntime, SUPPORTED_MODEL_TYPES, SmoothingConfig, create_engine
 
 
 def _load_snapshot_download():
@@ -212,7 +212,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enable-async-inference",
         action="store_true",
-        help="Start the async inference worker for control-loop validation. Effective only in step mode.",
+        help="Validate the control loop through AsyncInferenceRuntime. Effective only in step mode.",
     )
     parser.add_argument(
         "--dataset-gripper-scale",
@@ -573,7 +573,7 @@ def _resolve_execution_mode(args: argparse.Namespace) -> str:
 def _load_engine(model_type: str, model_dir: Path, args: argparse.Namespace, control_fps: float):
     smoothing_config = SmoothingConfig(
         control_fps=control_fps,
-        enable_async_inference=bool(args.enable_async_inference and not args.temporal_ensemble),
+        enable_async_inference=False,
         aggregate_fn_name="latest_only",
     )
     engine = create_engine(
@@ -587,6 +587,36 @@ def _load_engine(model_type: str, model_dir: Path, args: argparse.Namespace, con
         raise RuntimeError(error)
 
     return engine
+
+
+def _metadata_from_policy_metadata(metadata: Any) -> EngineMetadata:
+    return EngineMetadata(
+        required_cameras=list(metadata.required_cameras),
+        action_dim=int(metadata.action_dim),
+        chunk_size=int(metadata.chunk_size),
+        n_action_steps=int(metadata.n_action_steps),
+    )
+
+
+def _load_async_runtime(
+    model_type: str,
+    model_dir: Path,
+    args: argparse.Namespace,
+    control_fps: float,
+) -> tuple[AsyncInferenceRuntime, EngineMetadata]:
+    runtime = AsyncInferenceRuntime()
+    metadata = runtime.load_policy(
+        algorithm_type=model_type,
+        checkpoint_dir=str(model_dir),
+        device=args.device,
+        instruction=args.instruction,
+        config=AsyncInferenceConfig(
+            control_fps=control_fps,
+            chunk_size_threshold=0.5,
+            aggregate_fn_name="weighted_average",
+        ),
+    )
+    return runtime, _metadata_from_policy_metadata(metadata)
 
 
 def _configure_instruction(engine: Any, instruction: str | None) -> None:
@@ -710,7 +740,8 @@ def _write_episode_csv(episode_result: EpisodeResult, output_path: Path) -> None
 
 def _run_episode_validation(
     *,
-    engine: Any,
+    engine: Any | None,
+    async_runtime: AsyncInferenceRuntime | None,
     dataset: Any,
     dataset_indices: np.ndarray,
     all_actions: np.ndarray,
@@ -719,7 +750,6 @@ def _run_episode_validation(
     gripper_mode: str,
     explicit_instruction: str | None,
     execution_mode: str,
-    enable_async_inference: bool,
     temporal_ensemble_coeff: float | None,
 ) -> EpisodeResult:
     action_dim = int(metadata.action_dim)
@@ -730,19 +760,38 @@ def _run_episode_validation(
     task = ""
     total_call_ms = 0.0
     temporal_ensembler = TemporalEnsembler(coeff=temporal_ensemble_coeff) if temporal_ensemble_coeff is not None else None
+    async_started = False
 
-    engine.reset()
+    if async_runtime is not None:
+        async_runtime.reset(clear_metrics=False)
+    elif engine is not None:
+        engine.reset()
+    else:
+        raise ValueError("Either engine or async_runtime must be provided")
+
     if temporal_ensembler is not None:
         temporal_ensembler.reset()
 
     first_item = dataset[int(dataset_indices[0])]
     episode_instruction = _resolve_instruction(model_type, explicit_instruction, first_item)
-    _configure_instruction(engine, episode_instruction)
-
-    if execution_mode == "step" and enable_async_inference:
-        engine.start_async_inference()
-
+    if engine is not None:
+        _configure_instruction(engine, episode_instruction)
     try:
+        if async_runtime is not None:
+            first_observation = _build_observation(
+                item=first_item,
+                required_cameras=list(metadata.required_cameras),
+                gripper_mode=gripper_mode,
+                instruction=episode_instruction,
+            )
+            async_runtime.warmup(
+                images=first_observation.images,
+                state=first_observation.state,
+                instruction=episode_instruction,
+            )
+            async_runtime.start()
+            async_started = True
+
         for position, dataset_index in enumerate(dataset_indices.tolist(), start=1):
             item = dataset[int(dataset_index)]
             instruction = _resolve_instruction(model_type, explicit_instruction, item) or episode_instruction
@@ -754,7 +803,13 @@ def _run_episode_validation(
             )
 
             start_time = time.perf_counter()
-            if temporal_ensembler is not None:
+            if async_runtime is not None:
+                predicted_first = async_runtime.step(
+                    images=observation.images,
+                    state=observation.state,
+                    instruction=instruction,
+                ).action
+            elif temporal_ensembler is not None:
                 chunk = engine.predict_chunk(observation.images, observation.state)
                 predicted_first = temporal_ensembler.step(position - 1, chunk)
             elif execution_mode == "step":
@@ -784,8 +839,8 @@ def _run_episode_validation(
                     f"mae={sample_mae:.6f}"
                 )
     finally:
-        if execution_mode == "step" and enable_async_inference:
-            engine.stop_async_inference()
+        if async_started:
+            async_runtime.stop()
 
     predictions_array = np.asarray(predictions, dtype=np.float32)
     targets_array = np.asarray(targets, dtype=np.float32)
@@ -822,8 +877,7 @@ def _print_run_header(
     device: str,
     requested_execution_mode: str,
     resolved_execution_mode: str,
-    async_inference_requested: bool,
-    async_inference_runtime_enabled: bool,
+    async_inference_enabled: bool,
     temporal_ensemble_coeff: float | None,
 ) -> None:
     print("=" * 80)
@@ -840,11 +894,7 @@ def _print_run_header(
     print(f"Dataset gripper scale: {gripper_mode}")
     print(f"Device: {device}")
     print(f"Execution mode: requested={requested_execution_mode} resolved={resolved_execution_mode}")
-    print(
-        "Async inference: "
-        f"requested={'enabled' if async_inference_requested else 'disabled'}  "
-        f"runtime={'enabled' if async_inference_runtime_enabled else 'disabled'}"
-    )
+    print(f"Async inference: {'enabled' if async_inference_enabled else 'disabled'}")
     print(
         "Temporal ensembling: "
         + (
@@ -901,7 +951,9 @@ def main() -> int:
     if args.execution_mode == "raw" and args.temporal_ensemble:
         raise ValueError("`--temporal-ensemble` requires `--execution-mode step` or `--execution-mode auto`")
     if args.execution_mode == "raw" and args.enable_async_inference:
-        raise ValueError("`--enable-async-inference` requires `--execution-mode step` or `--execution-mode auto`")
+        raise ValueError(
+            "`--enable-async-inference` requires `--execution-mode step` or `--execution-mode auto`"
+        )
     if args.temporal_ensemble and args.enable_async_inference:
         raise ValueError("`--temporal-ensemble` cannot be combined with `--enable-async-inference` in this example")
 
@@ -932,16 +984,17 @@ def main() -> int:
     available_episode_ids = sorted(episode_to_indices.keys())
     episode_ids = _select_episode_ids(args, available_episode_ids)
 
-    engine = _load_engine(model_type, model_dir, args, float(dataset.fps))
+    engine = None
+    async_runtime = None
+    metadata = None
+    if args.enable_async_inference:
+        async_runtime, metadata = _load_async_runtime(model_type, model_dir, args, float(dataset.fps))
+    else:
+        engine = _load_engine(model_type, model_dir, args, float(dataset.fps))
 
     try:
-        metadata = _get_engine_metadata(engine)
-        async_inference_runtime_enabled = bool(
-            execution_mode == "step"
-            and args.enable_async_inference
-            and getattr(engine, "_async_worker", None) is not None
-            and temporal_ensemble_coeff is None
-        )
+        if metadata is None:
+            metadata = _get_engine_metadata(engine)
         if all_actions.shape[1] != metadata.action_dim:
             raise ValueError(
                 f"Dataset action dim ({all_actions.shape[1]}) does not match model action dim ({metadata.action_dim})"
@@ -961,8 +1014,7 @@ def main() -> int:
             device=args.device,
             requested_execution_mode=args.execution_mode,
             resolved_execution_mode=execution_mode,
-            async_inference_requested=args.enable_async_inference,
-            async_inference_runtime_enabled=async_inference_runtime_enabled,
+            async_inference_enabled=args.enable_async_inference,
             temporal_ensemble_coeff=temporal_ensemble_coeff,
         )
 
@@ -981,6 +1033,7 @@ def main() -> int:
 
             result = _run_episode_validation(
                 engine=engine,
+                async_runtime=async_runtime,
                 dataset=dataset,
                 dataset_indices=episode_indices,
                 all_actions=all_actions,
@@ -989,7 +1042,6 @@ def main() -> int:
                 gripper_mode=gripper_mode,
                 explicit_instruction=args.instruction,
                 execution_mode=execution_mode,
-                enable_async_inference=async_inference_runtime_enabled,
                 temporal_ensemble_coeff=temporal_ensemble_coeff,
             )
 
@@ -1020,7 +1072,10 @@ def main() -> int:
             )
             print("-" * 80)
     finally:
-        engine.unload()
+        if async_runtime is not None:
+            async_runtime.close()
+        if engine is not None:
+            engine.unload()
 
     overall_metrics = overall_accumulator.as_dict()
     summary = {
@@ -1034,8 +1089,7 @@ def main() -> int:
         "dataset_gripper_scale": gripper_mode,
         "requested_execution_mode": args.execution_mode,
         "resolved_execution_mode": execution_mode,
-        "async_inference_requested": args.enable_async_inference,
-        "async_inference_runtime_enabled": async_inference_runtime_enabled,
+        "async_inference_enabled": args.enable_async_inference,
         "temporal_ensemble_enabled": args.temporal_ensemble,
         "temporal_ensemble_coeff": temporal_ensemble_coeff,
         "episodes": [

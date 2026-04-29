@@ -44,7 +44,6 @@ configure_optional_import_paths()
 
 from .base import (  # noqa: E402
     AGGREGATE_FUNCTIONS,
-    AsyncInferenceWorker,
     BaseInferenceEngine,
     GripperSmoother,
     LatencyEstimator,
@@ -58,6 +57,20 @@ from .base import (  # noqa: E402
     get_aggregate_function,
 )
 from .api import InferenceSDK, Observation, PolicyMetadata, predict_action_chunk  # noqa: E402
+from .async_runtime import (  # noqa: E402
+    AsyncInferenceConfig,
+    AsyncInferenceRuntime,
+    AsyncRuntimeState,
+    AsyncRuntimeStatus,
+    AsyncStepResult,
+    QueueSnapshotEntry,
+    async_step,
+    get_async_status,
+    get_global_async_runtime,
+    load_async_policy,
+    start_async_runtime,
+    stop_async_runtime,
+)
 from .policy import (  # noqa: E402
     ACT_AVAILABLE,
     PI0_AVAILABLE,
@@ -77,7 +90,11 @@ __all__ = [
     "AGGREGATE_FUNCTIONS",
     "ACTInferenceEngine",
     "ACT_AVAILABLE",
-    "AsyncInferenceWorker",
+    "AsyncInferenceConfig",
+    "AsyncInferenceRuntime",
+    "AsyncRuntimeState",
+    "AsyncRuntimeStatus",
+    "AsyncStepResult",
     "BaseInferenceEngine",
     "GripperSmoother",
     "LatencyEstimator",
@@ -95,6 +112,7 @@ __all__ = [
     "SmolVLAInferenceEngine",
     "SMOLVLA_AVAILABLE",
     "PolicyMetadata",
+    "QueueSnapshotEntry",
     "SmoothingConfig",
     "SUPPORTED_MODEL_TYPES",
     "TimedAction",
@@ -104,9 +122,15 @@ __all__ = [
     "TraceRecorder",
     "UnsupportedCheckpointFormatError",
     "__version__",
+    "async_step",
     "create_engine",
     "create_inference_engine",
+    "get_async_status",
     "get_aggregate_function",
+    "get_global_async_runtime",
+    "load_async_policy",
     "normalize_model_type",
     "predict_action_chunk",
+    "start_async_runtime",
+    "stop_async_runtime",
 ]

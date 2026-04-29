@@ -124,7 +124,7 @@ python examples/validate_dataset_inference.py \
 - 因为传了 `--temporal-ensemble`，默认会自动切到 `step` 模式
 - 这时候你看到的曲线会反映 chunk 重叠动作经指数加权后的执行结果
 
-### 1.2 验证异步推理控制环
+### 1.2 验证 step 控制环
 
 ```bash
 python examples/validate_dataset_inference.py \
@@ -132,14 +132,22 @@ python examples/validate_dataset_inference.py \
   --model-type act \
   --dataset data/lerobot/z18820636149/pick_and_place_data90 \
   --episode 0 \
-  --execution-mode step \
-  --enable-async-inference
+  --execution-mode step
 ```
 
 说明：
 
-- 这条命令会调用 `step()`，并在每个 episode `reset()` 后重新启动 async worker
-- 如果模型或运行配置不允许异步，脚本头部会显示 `runtime=disabled`
+- 这条命令会调用底层 engine 的同步 `step()` 队列路径
+- 如需验证进程内异步 runtime，可加 `--enable-async-inference`
+- 异步验证脚本会按 runtime 返回的 `action_timestep` 对齐 dataset target，避免队列动作看起来整体慢一帧
+
+```bash
+python examples/validate_dataset_async_inference.py \
+  --model models/ACT_pick_and_place_v2 \
+  --model-type act \
+  --dataset data/lerobot/z18820636149/pick_and_place_data90 \
+  --episode 0
+```
 
 ### 2. 验证一个 PI0 模型
 

@@ -51,7 +51,7 @@ def create_engine(
     """
     if smoothing_config is None:
         smoothing_config = SmoothingConfig(
-            enable_async_inference=True,
+            enable_async_inference=False,
             aggregate_fn_name="latest_only",
         )
 

@@ -342,7 +342,7 @@ class ACTInferenceEngine(BaseInferenceEngine):
             
             self.is_loaded = True
             
-            # Initialize all components (queue, latency estimator, gripper smoother, async worker)
+            # Initialize all components (queue, latency estimator, gripper smoother)
             self._init_components()
             self.reset()
             

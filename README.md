@@ -95,6 +95,32 @@ engine.reset()
 action = engine.select_action(images=images, state=state)
 ```
 
+### 进程内异步推理
+
+如果需要将动作执行和模型推理解耦，可以使用全局异步推理运行时。该方式不启动 gRPC server/client，而是在当前 Python 后端进程内维护观测队列、后台推理线程和动作队列。
+
+```python
+from inference_sdk import AsyncInferenceConfig, get_global_async_runtime
+
+runtime = get_global_async_runtime()
+runtime.load_policy(
+    algorithm_type="act",
+    checkpoint_dir="/path/to/checkpoint",
+    device="cuda:0",
+    config=AsyncInferenceConfig(
+        control_fps=30.0,
+        chunk_size_threshold=0.5,
+        aggregate_fn_name="weighted_average",
+    ),
+)
+runtime.start()
+
+result = runtime.step(images=images, state=robot_state)
+robot.send_action(result.action)
+```
+
+完整控制循环模板见 `examples/async_runtime_loop.py`，设计方案见 `docs/async_inference_plan.md`。
+
 ## 运行环境
 
 SDK 不依赖固定的宿主项目目录结构。
