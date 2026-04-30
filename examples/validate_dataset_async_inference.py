@@ -4,13 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 EXAMPLES_DIR = Path(__file__).resolve().parent
 REPO_ROOT = EXAMPLES_DIR.parent
@@ -19,7 +24,6 @@ if str(REPO_ROOT) not in sys.path:
 if str(EXAMPLES_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLES_DIR))
 
-from inference_sdk import AsyncInferenceConfig, AsyncInferenceRuntime, SUPPORTED_MODEL_TYPES
 from validate_dataset_inference import (
     EngineMetadata,
     ErrorAccumulator,
@@ -44,6 +48,7 @@ from validate_dataset_inference import (
     _write_episode_csv,
     _write_summary_csv,
 )
+from inference_sdk import AsyncInferenceConfig, AsyncInferenceRuntime, SUPPORTED_MODEL_TYPES
 
 
 def _parse_args() -> argparse.Namespace:
@@ -108,6 +113,36 @@ def _parse_args() -> argparse.Namespace:
         help="Aggregation strategy for overlapping async action chunks.",
     )
     parser.add_argument(
+        "--playback-mode",
+        choices=["fast", "realtime"],
+        default="realtime",
+        help=(
+            "Dataset playback mode. `fast` advances simulated timesteps as quickly as possible; "
+            "`realtime` sleeps at dataset FPS so the background worker gets real control-loop time."
+        ),
+    )
+    parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=5.0,
+        help="Seconds to wait for the warmup action queue before entering the loop.",
+    )
+    parser.add_argument(
+        "--disable-gripper-clamping",
+        action="store_true",
+        help="Disable runtime gripper velocity clamping for curve comparison.",
+    )
+    parser.add_argument(
+        "--debug-threads",
+        action="store_true",
+        help="Print remaining non-daemon Python threads before exit.",
+    )
+    parser.add_argument(
+        "--force-exit",
+        action="store_true",
+        help="Force os._exit(0) after reports are flushed; useful if third-party libraries leave non-daemon threads.",
+    )
+    parser.add_argument(
         "--dataset-gripper-scale",
         choices=["auto", "normalized", "raw"],
         default="auto",
@@ -152,9 +187,41 @@ def _load_runtime(
             control_fps=control_fps,
             chunk_size_threshold=args.chunk_size_threshold,
             aggregate_fn_name=args.aggregate_fn,
+            enable_gripper_clamping=not args.disable_gripper_clamping,
         ),
     )
     return runtime, _metadata_from_policy_metadata(metadata)
+
+
+def _sleep_until_dataset_tick(start_time: float, timestep: int, fps: float) -> None:
+    target_time = start_time + (timestep + 1) / fps
+    time.sleep(max(0.0, target_time - time.monotonic()))
+
+
+def _cleanup_process_resources(*, debug_threads: bool) -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    gc.collect()
+
+    if debug_threads:
+        current = threading.current_thread()
+        remaining = [
+            thread
+            for thread in threading.enumerate()
+            if thread is not current and thread.is_alive() and not thread.daemon
+        ]
+        if remaining:
+            print("Remaining non-daemon threads:")
+            for thread in remaining:
+                print(f"  name={thread.name!r} ident={thread.ident}")
+        else:
+            print("Remaining non-daemon threads: none")
 
 
 def _print_run_header(
@@ -187,6 +254,8 @@ def _print_run_header(
     print("Execution mode: async runtime")
     print(f"Chunk threshold: {args.chunk_size_threshold}")
     print(f"Aggregate fn: {args.aggregate_fn}")
+    print(f"Playback mode: {args.playback_mode}")
+    print(f"Gripper clamping: {'disabled' if args.disable_gripper_clamping else 'enabled'}")
     print(f"Episodes to validate: {episode_ids}")
     print(f"Output dir: {output_dir}")
     print("=" * 80)
@@ -202,6 +271,7 @@ def _run_async_episode_validation(
     model_type: str,
     gripper_mode: str,
     explicit_instruction: str | None,
+    args: argparse.Namespace,
 ) -> EpisodeResult:
     action_dim = int(metadata.action_dim)
     accumulator = ErrorAccumulator(action_dim=action_dim)
@@ -234,6 +304,9 @@ def _run_async_episode_validation(
         )
         runtime.start()
         started = True
+        if not runtime.wait_until_ready(min_queue_size=1, timeout=args.startup_timeout):
+            status = runtime.get_status()
+            raise RuntimeError(f"Async runtime did not become ready: state={status.state} error={status.last_error}")
 
         for position, dataset_index in enumerate(dataset_indices.tolist(), start=1):
             control_timestep = position - 1
@@ -286,8 +359,11 @@ def _run_async_episode_validation(
                     f"dataset_idx={dataset_index:05d} target_idx={target_dataset_index:05d} "
                     f"action_ts={result.action_timestep} frame_idx={frame_indices[-1]:04d} "
                     f"source={result.source} queue={result.queue_size} "
-                    f"fallbacks={status.fallback_count} mae={sample_mae:.6f}"
+                    f"fallbacks={status.fallback_count} dropped_obs={status.dropped_observation_count} "
+                    f"infer_ms={status.last_inference_ms} mae={sample_mae:.6f}"
                 )
+            if args.playback_mode == "realtime":
+                _sleep_until_dataset_tick(simulation_start, control_timestep, float(dataset.fps))
     finally:
         if started:
             runtime.stop()
@@ -383,6 +459,7 @@ def main() -> int:
                 model_type=model_type,
                 gripper_mode=gripper_mode,
                 explicit_instruction=args.instruction,
+                args=args,
             )
 
             for prediction, target in zip(result.predictions, result.targets, strict=True):
@@ -410,6 +487,13 @@ def main() -> int:
                 f"avg_step_ms={result.average_call_ms:.2f} "
                 f"plot={plot_path.name}"
             )
+            status = runtime.get_status()
+            print(
+                "Runtime stats: "
+                f"inferences={status.inference_count} processed_obs={status.processed_observation_count} "
+                f"dropped_obs={status.dropped_observation_count} skipped_obs={status.skipped_observation_count} "
+                f"fallbacks={status.fallback_count} last_infer_ms={status.last_inference_ms}"
+            )
             print("-" * 80)
     finally:
         runtime.close()
@@ -425,6 +509,8 @@ def main() -> int:
         "control_fps": float(dataset.fps),
         "chunk_size_threshold": args.chunk_size_threshold,
         "aggregate_fn": args.aggregate_fn,
+        "playback_mode": args.playback_mode,
+        "gripper_clamping_enabled": not args.disable_gripper_clamping,
         "dataset_gripper_scale": gripper_mode,
         "execution_mode": "async_runtime",
         "episodes": [
@@ -459,6 +545,12 @@ def main() -> int:
     print(f"Plots dir: {plots_dir}")
     print(f"Episode CSV dir: {csv_dir}")
     print(f"Summary JSON: {summary_json_path}")
+
+    _cleanup_process_resources(debug_threads=args.debug_threads)
+    if args.force_exit:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
     return 0
 

@@ -140,6 +140,7 @@ python examples/validate_dataset_inference.py \
 - 这条命令会调用底层 engine 的同步 `step()` 队列路径
 - 如需验证进程内异步 runtime，可加 `--enable-async-inference`
 - 异步验证脚本会按 runtime 返回的 `action_timestep` 对齐 dataset target，避免队列动作看起来整体慢一帧
+- 异步验证脚本默认使用 `--playback-mode realtime`，按 dataset FPS 播放；大模型不要用最快速离线循环判断曲线，否则后台推理线程拿不到真实控制周期
 
 ```bash
 python examples/validate_dataset_async_inference.py \
@@ -203,6 +204,8 @@ python examples/validate_dataset_inference.py \
 - `--dataset-gripper-scale`：夹爪值缩放模式，通常保留默认 `auto`
 - `--video-backend`：LeRobotDataset 使用的视频后端，默认 `pyav`
 - `--max-frames`：只处理前 N 帧，便于调试
+- `--playback-mode`：仅异步验证脚本使用，`realtime` 按 FPS sleep，`fast` 只推进模拟 timestep
+- `--debug-threads` / `--force-exit`：仅异步验证脚本使用，用于定位或绕过第三方库残留非 daemon 线程导致的退出阻塞
 
 ## 输出结果
 

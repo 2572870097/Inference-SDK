@@ -13,6 +13,7 @@ Implements action queue based inference:
 import json
 import logging
 import os
+import gc
 from contextlib import contextmanager
 from dataclasses import fields
 from pathlib import Path
@@ -28,6 +29,8 @@ from ..device import resolve_torch_device
 from ..runtime import iter_model_search_roots, iter_unique_paths
 
 logger = logging.getLogger(__name__)
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 try:
     from safetensors.torch import load_file as load_safetensors_file
@@ -130,12 +133,71 @@ def _extract_stats_from_safetensors(state_path: Path) -> Dict[str, Dict[str, Any
     stats: Dict[str, Dict[str, Any]] = {}
 
     for key, value in state_dict.items():
-        if not (key.endswith(".mean") or key.endswith(".std")):
+        if "." not in key:
             continue
         feature_name, stat_name = key.rsplit(".", 1)
+        if stat_name not in {"mean", "std", "min", "max", "q01", "q99", "q10", "q90"}:
+            continue
         stats.setdefault(feature_name, {})[stat_name] = value.cpu().tolist()
 
     return stats
+
+
+def _normalization_mode_name(value: Any) -> str:
+    mode = getattr(value, "value", value)
+    return str(mode).upper()
+
+
+def _stats_tensor(stats: Dict[str, Any], name: str, *, like: torch.Tensor) -> torch.Tensor:
+    if name not in stats:
+        raise ValueError(f"PI0 normalization stats missing `{name}`")
+    return torch.as_tensor(stats[name], dtype=like.dtype, device=like.device)
+
+
+def _apply_feature_normalization(
+    *,
+    tensor: torch.Tensor,
+    key: str,
+    feature_type: str,
+    config_dict: Optional[Dict[str, Any]],
+    stats: Optional[Dict[str, Dict[str, Any]]],
+    inverse: bool,
+) -> torch.Tensor:
+    if config_dict is None or stats is None or key not in stats:
+        return tensor
+
+    norm_map = config_dict.get("normalization_mapping") or {}
+    mode = _normalization_mode_name(norm_map.get(feature_type, "IDENTITY"))
+    if mode == "IDENTITY":
+        return tensor
+
+    feature_stats = stats[key]
+    eps = torch.tensor(1e-8, dtype=tensor.dtype, device=tensor.device)
+
+    if mode == "MEAN_STD":
+        mean = _stats_tensor(feature_stats, "mean", like=tensor)
+        std = _stats_tensor(feature_stats, "std", like=tensor)
+        return tensor * std + mean if inverse else (tensor - mean) / (std + eps)
+
+    if mode == "MIN_MAX":
+        min_value = _stats_tensor(feature_stats, "min", like=tensor)
+        max_value = _stats_tensor(feature_stats, "max", like=tensor)
+        denom = torch.where(max_value == min_value, eps, max_value - min_value)
+        return (tensor + 1.0) * denom / 2.0 + min_value if inverse else 2.0 * (tensor - min_value) / denom - 1.0
+
+    if mode == "QUANTILES":
+        low = _stats_tensor(feature_stats, "q01", like=tensor)
+        high = _stats_tensor(feature_stats, "q99", like=tensor)
+        denom = torch.where(high == low, eps, high - low)
+        return (tensor + 1.0) * denom / 2.0 + low if inverse else 2.0 * (tensor - low) / denom - 1.0
+
+    if mode == "QUANTILE10":
+        low = _stats_tensor(feature_stats, "q10", like=tensor)
+        high = _stats_tensor(feature_stats, "q90", like=tensor)
+        denom = torch.where(high == low, eps, high - low)
+        return (tensor + 1.0) * denom / 2.0 + low if inverse else 2.0 * (tensor - low) / denom - 1.0
+
+    raise ValueError(f"Unsupported PI0 normalization mode: {mode}")
 
 
 def _load_pretrained_pi0_stats(checkpoint_path: Path) -> Dict[str, Dict[str, Any]]:
@@ -560,6 +622,14 @@ class PI0InferenceEngine(BaseInferenceEngine):
                 for key, value in fixed_state_dict.items()
             }
             missing_keys, unexpected_keys = self.model.load_state_dict(inner_state_dict, strict=False)
+            if missing_keys or unexpected_keys:
+                logger.warning(
+                    "PI0 weights loaded with strict=False: missing=%s unexpected=%s missing_sample=%s unexpected_sample=%s",
+                    len(missing_keys),
+                    len(unexpected_keys),
+                    list(missing_keys[:8]),
+                    list(unexpected_keys[:8]),
+                )
 
             self.is_loaded = True
             self._init_components()
@@ -678,24 +748,28 @@ class PI0InferenceEngine(BaseInferenceEngine):
             state[-1] = state[-1] / 1000.0
 
         state_tensor = torch.from_numpy(state).float()
-
-        if self.stats is not None and "observation.state" in self.stats:
-            stats = self.stats["observation.state"]
-            mean = torch.tensor(stats["mean"])
-            std = torch.tensor(stats["std"])
-            state_tensor = (state_tensor - mean) / (std + 1e-6)
+        state_tensor = _apply_feature_normalization(
+            tensor=state_tensor,
+            key="observation.state",
+            feature_type="STATE",
+            config_dict=self.config_dict,
+            stats=self.stats,
+            inverse=False,
+        )
 
         return state_tensor.unsqueeze(0).to(self.device)
 
     def _postprocess_action(self, action_tensor: torch.Tensor) -> np.ndarray:
         """Postprocess PI0 normalized action tensor back to robot action space."""
         action = action_tensor.cpu()
-
-        if self.stats is not None and "action" in self.stats:
-            stats = self.stats["action"]
-            mean = torch.tensor(stats["mean"])
-            std = torch.tensor(stats["std"])
-            action = action * std + mean
+        action = _apply_feature_normalization(
+            tensor=action,
+            key="action",
+            feature_type="ACTION",
+            config_dict=self.config_dict,
+            stats=self.stats,
+            inverse=True,
+        )
 
         action = action.numpy()
 
@@ -764,5 +838,7 @@ class PI0InferenceEngine(BaseInferenceEngine):
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        gc.collect()
 
         logger.info("PI0 model unloaded")
