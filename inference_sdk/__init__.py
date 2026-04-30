@@ -27,7 +27,7 @@ else:
     try:
         import lerobot.policies.rtc  # noqa: F401
     except Exception as exc:
-        logger.warning("Failed to preload lerobot RTC policies, continuing: %s", exc)
+        logger.debug("Failed to preload lerobot RTC policies, continuing: %s", exc)
 
 from .exceptions import (  # noqa: E402
     CheckpointNotFoundError,

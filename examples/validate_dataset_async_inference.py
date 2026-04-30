@@ -114,11 +114,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--playback-mode",
-        choices=["fast", "realtime"],
-        default="realtime",
+        choices=["offline", "fast", "realtime"],
+        default="offline",
         help=(
-            "Dataset playback mode. `fast` advances simulated timesteps as quickly as possible; "
-            "`realtime` sleeps at dataset FPS so the background worker gets real control-loop time."
+            "Validation playback mode. `offline` runs one synchronous chunk prediction per dataset frame "
+            "and compares chunk[0] against that frame; `fast`/`realtime` exercise the live async queue."
         ),
     )
     parser.add_argument(
@@ -251,7 +251,7 @@ def _print_run_header(
     print(f"Action dim: {metadata.action_dim}  Chunk size: {metadata.chunk_size}")
     print(f"Dataset gripper scale: {gripper_mode}")
     print(f"Device: {args.device}")
-    print("Execution mode: async runtime")
+    print("Execution mode: async runtime" if args.playback_mode != "offline" else "Execution mode: offline chunk validation")
     print(f"Chunk threshold: {args.chunk_size_threshold}")
     print(f"Aggregate fn: {args.aggregate_fn}")
     print(f"Playback mode: {args.playback_mode}")
@@ -387,6 +387,87 @@ def _run_async_episode_validation(
     )
 
 
+def _run_offline_episode_validation(
+    *,
+    runtime: AsyncInferenceRuntime,
+    dataset: Any,
+    dataset_indices: np.ndarray,
+    all_actions: np.ndarray,
+    metadata: EngineMetadata,
+    model_type: str,
+    gripper_mode: str,
+    explicit_instruction: str | None,
+) -> EpisodeResult:
+    action_dim = int(metadata.action_dim)
+    accumulator = ErrorAccumulator(action_dim=action_dim)
+    predictions: list[np.ndarray] = []
+    targets: list[np.ndarray] = []
+    frame_indices: list[int] = []
+    task = ""
+    total_call_ms = 0.0
+
+    runtime.reset(clear_metrics=False)
+    first_item = dataset[int(dataset_indices[0])]
+    episode_instruction = _resolve_instruction(model_type, explicit_instruction, first_item)
+
+    for position, dataset_index in enumerate(dataset_indices.tolist(), start=1):
+        item = dataset[int(dataset_index)]
+        instruction = _resolve_instruction(model_type, explicit_instruction, item) or episode_instruction
+        observation = _build_observation(
+            item=item,
+            required_cameras=list(metadata.required_cameras),
+            gripper_mode=gripper_mode,
+            instruction=instruction,
+        )
+
+        start_time = time.perf_counter()
+        chunk = runtime.predict_action_chunk(
+            images=observation.images,
+            state=observation.state,
+            instruction=instruction,
+        )
+        total_call_ms += (time.perf_counter() - start_time) * 1000.0
+
+        prediction = _adapt_prediction_for_dataset(chunk[0], gripper_mode)[0]
+        target = all_actions[int(dataset_index)]
+        accumulator.update(prediction, target)
+
+        predictions.append(prediction)
+        targets.append(target)
+
+        frame_value = item["frame_index"]
+        if hasattr(frame_value, "item"):
+            frame_value = frame_value.item()
+        frame_indices.append(int(frame_value))
+        task = str(item.get("task", task))
+
+        if position == 1 or position == len(dataset_indices) or position % 50 == 0:
+            sample_mae = float(np.mean(np.abs(prediction - target)))
+            print(
+                f"  frame {position:04d}/{len(dataset_indices):04d} "
+                f"dataset_idx={dataset_index:05d} frame_idx={frame_indices[-1]:04d} "
+                f"infer_ms={total_call_ms / position:.3f} mae={sample_mae:.6f}"
+            )
+
+    predictions_array = np.asarray(predictions, dtype=np.float32)
+    targets_array = np.asarray(targets, dtype=np.float32)
+    metrics = accumulator.as_dict()
+    episode_value = dataset.hf_dataset[int(dataset_indices[0])]["episode_index"]
+    if hasattr(episode_value, "item"):
+        episode_value = episode_value.item()
+
+    return EpisodeResult(
+        episode_index=int(episode_value),
+        task=task,
+        dataset_indices=dataset_indices.copy(),
+        frame_indices=np.asarray(frame_indices, dtype=np.int64),
+        predictions=predictions_array,
+        targets=targets_array,
+        metrics=metrics,
+        average_call_ms=total_call_ms / max(1, len(dataset_indices)),
+    )
+
+
 def main() -> int:
     args = _parse_args()
     scope = "all_episodes" if args.all_episodes else f"episode_{args.episode:03d}"
@@ -450,17 +531,29 @@ def main() -> int:
                 continue
 
             print(f"Episode {episode_index} start: {len(episode_indices)} frames")
-            result = _run_async_episode_validation(
-                runtime=runtime,
-                dataset=dataset,
-                dataset_indices=episode_indices,
-                all_actions=all_actions,
-                metadata=metadata,
-                model_type=model_type,
-                gripper_mode=gripper_mode,
-                explicit_instruction=args.instruction,
-                args=args,
-            )
+            if args.playback_mode == "offline":
+                result = _run_offline_episode_validation(
+                    runtime=runtime,
+                    dataset=dataset,
+                    dataset_indices=episode_indices,
+                    all_actions=all_actions,
+                    metadata=metadata,
+                    model_type=model_type,
+                    gripper_mode=gripper_mode,
+                    explicit_instruction=args.instruction,
+                )
+            else:
+                result = _run_async_episode_validation(
+                    runtime=runtime,
+                    dataset=dataset,
+                    dataset_indices=episode_indices,
+                    all_actions=all_actions,
+                    metadata=metadata,
+                    model_type=model_type,
+                    gripper_mode=gripper_mode,
+                    explicit_instruction=args.instruction,
+                    args=args,
+                )
 
             for prediction, target in zip(result.predictions, result.targets, strict=True):
                 overall_accumulator.update(prediction, target)
@@ -487,13 +580,16 @@ def main() -> int:
                 f"avg_step_ms={result.average_call_ms:.2f} "
                 f"plot={plot_path.name}"
             )
-            status = runtime.get_status()
-            print(
-                "Runtime stats: "
-                f"inferences={status.inference_count} processed_obs={status.processed_observation_count} "
-                f"dropped_obs={status.dropped_observation_count} skipped_obs={status.skipped_observation_count} "
-                f"fallbacks={status.fallback_count} last_infer_ms={status.last_inference_ms}"
-            )
+            if args.playback_mode == "offline":
+                print("Runtime stats: offline direct chunks, no async queue/drop/fallback metrics")
+            else:
+                status = runtime.get_status()
+                print(
+                    "Runtime stats: "
+                    f"inferences={status.inference_count} processed_obs={status.processed_observation_count} "
+                    f"dropped_obs={status.dropped_observation_count} skipped_obs={status.skipped_observation_count} "
+                    f"fallbacks={status.fallback_count} last_infer_ms={status.last_inference_ms}"
+                )
             print("-" * 80)
     finally:
         runtime.close()
@@ -512,7 +608,7 @@ def main() -> int:
         "playback_mode": args.playback_mode,
         "gripper_clamping_enabled": not args.disable_gripper_clamping,
         "dataset_gripper_scale": gripper_mode,
-        "execution_mode": "async_runtime",
+        "execution_mode": "offline_chunk_validation" if args.playback_mode == "offline" else "async_runtime",
         "episodes": [
             {
                 "episode_index": result.episode_index,

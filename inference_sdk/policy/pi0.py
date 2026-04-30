@@ -26,7 +26,7 @@ import yaml
 
 from ..base import BaseInferenceEngine, SmoothingConfig
 from ..device import resolve_torch_device
-from ..runtime import iter_model_search_roots, iter_unique_paths
+from ..runtime import format_optional_dependency_error, iter_model_search_roots, iter_unique_paths
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +248,44 @@ def _load_pi0_state_dict(checkpoint_path: Path, device: torch.device) -> Dict[st
         return torch.load(model_path, map_location=device)
 
 
+def _remap_pi0_state_dict_for_model(
+    state_dict: Dict[str, torch.Tensor],
+    model_state_dict: Dict[str, torch.Tensor],
+) -> tuple[Dict[str, torch.Tensor], int, list[str]]:
+    """Adapt exported PI0 checkpoint keys to the local SparkMind module layout."""
+    model_keys = set(model_state_dict.keys())
+    remapped: Dict[str, torch.Tensor] = {}
+    remap_count = 0
+    skipped_shape_mismatches: list[str] = []
+
+    for key, value in state_dict.items():
+        candidates = [key]
+        if ".vision_tower.vision_model." in key:
+            candidates.append(key.replace(".vision_tower.vision_model.", ".vision_tower."))
+
+        selected_key = key
+        for candidate in candidates:
+            expected = model_state_dict.get(candidate)
+            if expected is None:
+                continue
+            if tuple(expected.shape) == tuple(value.shape):
+                selected_key = candidate
+                break
+            skipped_shape_mismatches.append(
+                f"{candidate}: checkpoint={tuple(value.shape)} model={tuple(expected.shape)}"
+            )
+
+        if selected_key in remapped and selected_key != key:
+            logger.warning("Skipping duplicate PI0 checkpoint key after remap: %s -> %s", key, selected_key)
+            continue
+
+        remapped[selected_key] = value
+        if selected_key != key and selected_key in model_keys:
+            remap_count += 1
+
+    return remapped, remap_count, skipped_shape_mismatches
+
+
 def _is_local_model_dir(path: Path) -> bool:
     return path.is_dir() and (
         (path / "tokenizer_config.json").is_file()
@@ -408,6 +446,7 @@ def _format_pi0_load_error(error: Exception, requested_tokenizer: str) -> str:
 
 
 PI0_AVAILABLE = False
+PI0_IMPORT_ERROR: Exception | None = None
 try:
     from transformers import AutoTokenizer
 
@@ -419,6 +458,7 @@ try:
     PI0_AVAILABLE = True
     logger.info("SparkMind PI0 model loaded successfully")
 except Exception as e:
+    PI0_IMPORT_ERROR = e
     logger.warning("SparkMind PI0 model not available: %s", e)
 
 
@@ -541,7 +581,14 @@ class PI0InferenceEngine(BaseInferenceEngine):
     def load(self, checkpoint_dir: str, tokenizer_path: Optional[str] = None) -> Tuple[bool, str]:
         """Load PI0 model from checkpoint."""
         if not PI0_AVAILABLE:
-            return False, "PI0模型依赖未安装 (SparkMind/transformers)"
+            return False, format_optional_dependency_error(
+                "PI0 模型所需的 SparkMind / transformers",
+                PI0_IMPORT_ERROR,
+                min_python=(3, 12),
+                install_hint=(
+                    "如果你使用本地 SparkMind checkout，请用 Python 3.12+ 重建虚拟环境后再安装。"
+                ),
+            )
 
         valid, error = self.validate_checkpoint(checkpoint_dir)
         if not valid:
@@ -608,6 +655,22 @@ class PI0InferenceEngine(BaseInferenceEngine):
             self.model.eval()
 
             original_state_dict = _load_pi0_state_dict(checkpoint_path, self.device)
+            prefixed_model_state_dict = {
+                f"model.{key}": value
+                for key, value in self.model.state_dict().items()
+            }
+            original_state_dict, pre_remapped_key_count, pre_skipped_shape_mismatches = _remap_pi0_state_dict_for_model(
+                original_state_dict,
+                prefixed_model_state_dict,
+            )
+            if pre_remapped_key_count:
+                logger.info("Pre-remapped %s PI0 checkpoint keys before compatibility fix", pre_remapped_key_count)
+            if pre_skipped_shape_mismatches:
+                logger.warning(
+                    "Skipped %s PI0 pre-remaps due to shape mismatch, sample=%s",
+                    len(pre_skipped_shape_mismatches),
+                    pre_skipped_shape_mismatches[:4],
+                )
 
             class _PolicyShim:
                 __slots__ = ("model",)
@@ -616,11 +679,33 @@ class PI0InferenceEngine(BaseInferenceEngine):
                     self.model = model
 
             shim = _PolicyShim(self.model)
-            fixed_state_dict = PI0Policy._fix_pytorch_state_dict_keys(shim, original_state_dict, self.model.config)
+            class _IgnorePi0VisionEmbeddingWarning(logging.Filter):
+                def filter(self, record: logging.LogRecord) -> bool:
+                    return not record.getMessage().startswith("Vision embedding key might need handling:")
+
+            root_logger = logging.getLogger()
+            vision_warning_filter = _IgnorePi0VisionEmbeddingWarning()
+            root_logger.addFilter(vision_warning_filter)
+            try:
+                fixed_state_dict = PI0Policy._fix_pytorch_state_dict_keys(shim, original_state_dict, self.model.config)
+            finally:
+                root_logger.removeFilter(vision_warning_filter)
             inner_state_dict = {
                 (key[6:] if key.startswith("model.") else key): value
                 for key, value in fixed_state_dict.items()
             }
+            inner_state_dict, remapped_key_count, skipped_shape_mismatches = _remap_pi0_state_dict_for_model(
+                inner_state_dict,
+                self.model.state_dict(),
+            )
+            if remapped_key_count:
+                logger.info("Remapped %s PI0 checkpoint keys to local model layout", remapped_key_count)
+            if skipped_shape_mismatches:
+                logger.warning(
+                    "Skipped %s PI0 checkpoint key remaps due to shape mismatch, sample=%s",
+                    len(skipped_shape_mismatches),
+                    skipped_shape_mismatches[:4],
+                )
             missing_keys, unexpected_keys = self.model.load_state_dict(inner_state_dict, strict=False)
             if missing_keys or unexpected_keys:
                 logger.warning(

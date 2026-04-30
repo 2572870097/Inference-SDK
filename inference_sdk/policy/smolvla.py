@@ -24,7 +24,7 @@ import yaml
 
 from ..base import BaseInferenceEngine, SmoothingConfig
 from ..device import resolve_torch_device
-from ..runtime import iter_model_search_roots, iter_unique_paths
+from ..runtime import format_optional_dependency_error, iter_model_search_roots, iter_unique_paths
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +272,7 @@ def _format_smolvla_load_error(error: Exception, requested_vlm: str) -> str:
 
 # Try to import SparkMind SmolVLA model
 SMOLVLA_AVAILABLE = False
+SMOLVLA_IMPORT_ERROR: Exception | None = None
 try:
     from omegaconf import OmegaConf
     from sparkmind.learning.VLA.models.smolvla_model import VLAFlowMatching
@@ -280,6 +281,7 @@ try:
     SMOLVLA_AVAILABLE = True
     logger.info("SparkMind SmolVLA model loaded successfully")
 except Exception as e:
+    SMOLVLA_IMPORT_ERROR = e
     logger.warning(f"SparkMind SmolVLA model not available: {e}")
 
 
@@ -364,7 +366,14 @@ class SmolVLAInferenceEngine(BaseInferenceEngine):
     def load(self, checkpoint_dir: str) -> Tuple[bool, str]:
         """Load SmolVLA model from checkpoint."""
         if not SMOLVLA_AVAILABLE:
-            return False, "SmolVLA模型依赖未安装 (SparkMind/transformers)"
+            return False, format_optional_dependency_error(
+                "SmolVLA 模型所需的 SparkMind / transformers",
+                SMOLVLA_IMPORT_ERROR,
+                min_python=(3, 12),
+                install_hint=(
+                    "如果你使用本地 SparkMind checkout，请用 Python 3.12+ 重建虚拟环境后再安装。"
+                ),
+            )
         
         # Validate
         valid, error = self.validate_checkpoint(checkpoint_dir)

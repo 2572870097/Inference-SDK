@@ -45,6 +45,32 @@ def iter_env_paths(env_keys: Sequence[str]) -> Iterator[Path]:
     yield from iter_unique_paths(raw_candidates)
 
 
+def format_optional_dependency_error(
+    dependency_label: str,
+    import_error: BaseException | None = None,
+    *,
+    min_python: tuple[int, int] | None = None,
+    install_hint: str | None = None,
+) -> str:
+    """Build a user-facing error message for unavailable optional dependencies."""
+    parts = [f"{dependency_label} 依赖不可用。"]
+
+    if min_python is not None and sys.version_info < min_python:
+        current_python = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        required_python = f"{min_python[0]}.{min_python[1]}"
+        parts.append(
+            f"当前环境是 Python {current_python}，但该依赖需要 Python >={required_python}。"
+        )
+
+    if install_hint:
+        parts.append(install_hint)
+
+    if import_error is not None:
+        parts.append(f"底层导入错误: {import_error}")
+
+    return " ".join(parts)
+
+
 def configure_optional_import_paths(
     env_keys: Sequence[str] = SPARKMIND_PATH_ENV_KEYS,
 ) -> list[Path]:

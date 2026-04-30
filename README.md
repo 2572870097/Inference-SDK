@@ -13,9 +13,10 @@
 推荐使用 `uv` 管理隔离环境：
 
 ```bash
-uv venv --python 3.10 .venv
+uv venv --python 3.12 .venv
 source .venv/bin/activate
 uv pip install -e .
+uv pip install -e ../SparkMind
 ```
 
 可选依赖：
@@ -26,14 +27,6 @@ uv pip install -e .[examples]
 uv pip install -e .[vla]
 uv pip install -e .[all]
 ```
-
-如果你使用本地 `SparkMind` 代码仓库：
-
-```bash
-uv pip install -e ./SparkMind
-```
-
-`uv` 不是强制要求。如果你更习惯 `pip`、`venv` 或 `conda`，也可以使用它们来管理环境。
 
 ## 使用方式
 
@@ -120,34 +113,6 @@ robot.send_action(result.action)
 ```
 
 完整控制循环模板见 `examples/async_runtime_loop.py`，设计方案见 `docs/async_inference_plan.md`。
-
-## 运行环境
-
-SDK 不依赖固定的宿主项目目录结构。
-
-如果你使用本地 `SparkMind` 代码仓库，而不是已安装的 Python 包，可以设置以下任意一个环境变量：
-
-```bash
-export INFERENCE_SDK_SPARKMIND_PATH=/absolute/path/to/SparkMind
-export SPARKMIND_PATH=/absolute/path/to/SparkMind
-```
-
-如果 tokenizer 或 VLM 资源保存在本地模型目录中，可以通过以下环境变量指定路径：
-
-```bash
-export PI0_TOKENIZER_PATH=/absolute/path/to/tokenizer
-export SMOLVLA_VLM_MODEL_PATH=/absolute/path/to/vlm
-export INFERENCE_SDK_MODEL_ROOTS=/absolute/path/to/models
-```
-
-`INFERENCE_SDK_MODEL_ROOTS` 支持多个路径，路径之间使用 `:` 分隔。
-
-## 示例
-
-仓库中包含一个离线数据集验证示例：
-
-- `examples/validate_dataset_inference.py`
-- `examples/validate_dataset_inference.md`
 
 如果需要运行示例，请先安装绘图和 Hugging Face Hub 相关依赖：
 

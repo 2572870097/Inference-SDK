@@ -1,10 +1,12 @@
 # Local datasets and model weights
 /data/
 /models/
-
+data/
+models/
 # Local runtime outputs and caches
 /.cache/
 /outputs/
+/runs/
 
 # Python virtual environments
 /.venv/

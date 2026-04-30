@@ -19,6 +19,7 @@ import yaml
 
 from ..base import BaseInferenceEngine, SmoothingConfig
 from ..device import resolve_torch_device
+from ..runtime import format_optional_dependency_error
 
 logger = logging.getLogger(__name__)
 
@@ -178,12 +179,14 @@ def _load_act_state_dict(checkpoint_path: Path, device: torch.device) -> Dict[st
 
 # Try to import SparkMind ACT model
 ACT_AVAILABLE = False
+ACT_IMPORT_ERROR: Exception | None = None
 try:
     from omegaconf import OmegaConf
     from sparkmind.learning.IL.models.act_model import ACTModel
     ACT_AVAILABLE = True
     logger.info("SparkMind ACT model loaded successfully")
 except Exception as e:
+    ACT_IMPORT_ERROR = e
     logger.warning(f"SparkMind ACT model not available: {e}")
 
 
@@ -256,7 +259,14 @@ class ACTInferenceEngine(BaseInferenceEngine):
     def load(self, checkpoint_dir: str) -> Tuple[bool, str]:
         """Load ACT model from checkpoint."""
         if not ACT_AVAILABLE:
-            return False, "ACT模型依赖未安装 (SparkMind/omegaconf)"
+            return False, format_optional_dependency_error(
+                "ACT 模型所需的 SparkMind / omegaconf",
+                ACT_IMPORT_ERROR,
+                min_python=(3, 12),
+                install_hint=(
+                    "如果你使用本地 SparkMind checkout，请用 Python 3.12+ 重建虚拟环境后再安装。"
+                ),
+            )
         
         # Validate
         valid, error = self.validate_checkpoint(checkpoint_dir)
