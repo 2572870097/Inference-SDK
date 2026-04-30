@@ -133,7 +133,27 @@ python examples/validate_dataset_async_inference.py \
 - `pi0`、`pi05` 和 `smolvla` 通常需要语言指令
 - 如果不传 `--instruction`，脚本会优先使用数据集样本里的 `task` 字段
 
-### 3. 验证全部 episode
+### 3. 验证开启 RTC 的 PI0 / PI0.5 / SmolVLA
+
+```bash
+python examples/validate_dataset_async_inference.py \
+  --model /path/to/pi05_checkpoint \
+  --model-type pi05 \
+  --dataset /path/to/lerobot_dataset \
+  --episode 0 \
+  --instruction "pick up the object" \
+  --enable-rtc \
+  --rtc-prefix-attention-schedule LINEAR \
+  --rtc-execution-horizon 10 \
+  --rtc-inference-delay-steps 0
+```
+
+说明：
+
+- `--enable-rtc` 只支持 `smolvla`、`pi0`、`pi05`
+- `--rtc-inference-delay-steps` 是静态控制步延迟，默认 `0`
+
+### 4. 验证全部 episode
 
 ```bash
 python examples/validate_dataset_async_inference.py \
@@ -143,7 +163,7 @@ python examples/validate_dataset_async_inference.py \
   --all-episodes
 ```
 
-### 4. 只跑前 50 帧做快速调试
+### 5. 只跑前 50 帧做快速调试
 
 ```bash
 python examples/validate_dataset_async_inference.py \
@@ -154,7 +174,7 @@ python examples/validate_dataset_async_inference.py \
   --max-frames 50
 ```
 
-### 5. 更激进地补 action chunk
+### 6. 更激进地补 action chunk
 
 ```bash
 python examples/validate_dataset_async_inference.py \
@@ -171,7 +191,7 @@ python examples/validate_dataset_async_inference.py \
 - 阈值越大，runtime 越早提交新的 observation 请求下一段 chunk
 - 阈值越小，runtime 越倾向于等队列更接近耗尽时再补
 
-### 6. 切换重叠 chunk 的聚合策略
+### 7. 切换重叠 chunk 的聚合策略
 
 ```bash
 python examples/validate_dataset_async_inference.py \
@@ -203,6 +223,9 @@ python examples/validate_dataset_async_inference.py \
 - `--instruction`：显式语言指令，主要用于 `pi0` / `pi05` / `smolvla`
 - `--chunk-size-threshold`：动作队列填充比例阈值，默认 `0.5`
 - `--aggregate-fn`：重叠 chunk 的动作聚合策略，默认 `weighted_average`
+- `--enable-rtc`：为 `smolvla` / `pi0` / `pi05` 开启 RTC
+- `--rtc-prefix-attention-schedule`：RTC 前缀注意力权重，支持 `ZEROS`、`ONES`、`LINEAR`、`EXP`
+- `--rtc-execution-horizon` / `--rtc-inference-delay-steps`：RTC 执行窗口和静态推理延迟步数
 - `--dataset-gripper-scale`：夹爪值缩放模式，支持 `auto`、`normalized`、`raw`
 - `--video-backend`：`LeRobotDataset` 使用的视频后端，默认 `pyav`
 - `--max-frames`：只处理前 N 帧，便于调试

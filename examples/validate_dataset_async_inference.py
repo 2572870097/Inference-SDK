@@ -113,6 +113,46 @@ def _parse_args() -> argparse.Namespace:
         help="Aggregation strategy for overlapping async action chunks.",
     )
     parser.add_argument(
+        "--enable-rtc",
+        action="store_true",
+        help="Enable RTC for SmolVLA/PI0/PI0.5 policies.",
+    )
+    parser.add_argument(
+        "--rtc-prefix-attention-schedule",
+        choices=["ZEROS", "ONES", "LINEAR", "EXP", "zeros", "ones", "linear", "exp"],
+        default="LINEAR",
+        help="RTC prefix attention schedule. Default: LINEAR.",
+    )
+    parser.add_argument(
+        "--rtc-max-guidance-weight",
+        type=float,
+        default=10.0,
+        help="RTC max guidance weight. Default: 10.0.",
+    )
+    parser.add_argument(
+        "--rtc-execution-horizon",
+        type=int,
+        default=10,
+        help="RTC execution horizon. Default: 10.",
+    )
+    parser.add_argument(
+        "--rtc-inference-delay-steps",
+        type=int,
+        default=0,
+        help="Static RTC inference delay in control steps. Default: 0.",
+    )
+    parser.add_argument(
+        "--rtc-debug",
+        action="store_true",
+        help="Enable RTC debug tracking in SparkMind's RTCProcessor.",
+    )
+    parser.add_argument(
+        "--rtc-debug-maxlen",
+        type=int,
+        default=100,
+        help="Maximum RTC debug records to keep. Default: 100.",
+    )
+    parser.add_argument(
         "--playback-mode",
         choices=["offline", "fast", "realtime"],
         default="offline",
@@ -188,6 +228,13 @@ def _load_runtime(
             chunk_size_threshold=args.chunk_size_threshold,
             aggregate_fn_name=args.aggregate_fn,
             enable_gripper_clamping=not args.disable_gripper_clamping,
+            enable_rtc=args.enable_rtc,
+            rtc_prefix_attention_schedule=args.rtc_prefix_attention_schedule,
+            rtc_max_guidance_weight=args.rtc_max_guidance_weight,
+            rtc_execution_horizon=args.rtc_execution_horizon,
+            rtc_inference_delay_steps=args.rtc_inference_delay_steps,
+            rtc_debug=args.rtc_debug,
+            rtc_debug_maxlen=args.rtc_debug_maxlen,
         ),
     )
     return runtime, _metadata_from_policy_metadata(metadata)
@@ -254,6 +301,7 @@ def _print_run_header(
     print("Execution mode: async runtime" if args.playback_mode != "offline" else "Execution mode: offline chunk validation")
     print(f"Chunk threshold: {args.chunk_size_threshold}")
     print(f"Aggregate fn: {args.aggregate_fn}")
+    print(f"RTC: {'enabled' if args.enable_rtc else 'disabled'}")
     print(f"Playback mode: {args.playback_mode}")
     print(f"Gripper clamping: {'disabled' if args.disable_gripper_clamping else 'enabled'}")
     print(f"Episodes to validate: {episode_ids}")
@@ -482,6 +530,17 @@ def main() -> int:
     model_dir, model_label = _resolve_model_source(args.model)
     dataset_root, dataset_label = _resolve_dataset_source(args.dataset)
     model_type = _resolve_model_type(args.model_type, model_dir)
+    if args.enable_rtc and model_type not in {"smolvla", "pi0", "pi05"}:
+        raise ValueError("`--enable-rtc` is only supported for SmolVLA, PI0 and PI0.5")
+    if args.rtc_max_guidance_weight <= 0.0:
+        raise ValueError("`--rtc-max-guidance-weight` must be > 0")
+    if args.rtc_execution_horizon < 1:
+        raise ValueError("`--rtc-execution-horizon` must be >= 1")
+    if args.rtc_inference_delay_steps < 0:
+        raise ValueError("`--rtc-inference-delay-steps` must be >= 0")
+    if args.rtc_debug_maxlen < 1:
+        raise ValueError("`--rtc-debug-maxlen` must be >= 1")
+
     dataset_repo_id = _dataset_repo_id_for_source(args.dataset, dataset_root)
 
     LeRobotDataset = _load_dataset_class()
@@ -605,6 +664,11 @@ def main() -> int:
         "control_fps": float(dataset.fps),
         "chunk_size_threshold": args.chunk_size_threshold,
         "aggregate_fn": args.aggregate_fn,
+        "rtc_enabled": args.enable_rtc,
+        "rtc_prefix_attention_schedule": args.rtc_prefix_attention_schedule,
+        "rtc_max_guidance_weight": args.rtc_max_guidance_weight,
+        "rtc_execution_horizon": args.rtc_execution_horizon,
+        "rtc_inference_delay_steps": args.rtc_inference_delay_steps,
         "playback_mode": args.playback_mode,
         "gripper_clamping_enabled": not args.disable_gripper_clamping,
         "dataset_gripper_scale": gripper_mode,

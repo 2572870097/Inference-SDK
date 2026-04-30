@@ -1,10 +1,11 @@
 """Public type exports for the inference SDK."""
 
 from .api import Observation, PolicyMetadata
-from .base import SmoothingConfig, TimedAction, TimedObservation, TraceEvent, TraceRecorder
+from .base import ACTTemporalEnsembler, SmoothingConfig, TimedAction, TimedObservation, TraceEvent, TraceRecorder
 from .device import DeviceSelection
 
 __all__ = [
+    "ACTTemporalEnsembler",
     "DeviceSelection",
     "Observation",
     "PolicyMetadata",

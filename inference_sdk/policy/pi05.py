@@ -27,6 +27,7 @@ import yaml
 from ..base import BaseInferenceEngine, SmoothingConfig
 from ..device import resolve_torch_device
 from ..runtime import format_optional_dependency_error, iter_model_search_roots, iter_unique_paths
+from .rtc import make_rtc_config, make_rtc_processor
 
 logger = logging.getLogger(__name__)
 
@@ -530,6 +531,7 @@ class PI05InferenceEngine(BaseInferenceEngine):
         self._instruction: str = "Pick up the object."
         self._image_resize: Optional[Tuple[int, int]] = (224, 224)
         self._max_state_dim: int = 32
+        self._rtc_prev_chunk_left_over: Optional[torch.Tensor] = None
 
     @staticmethod
     def validate_checkpoint(checkpoint_dir: str) -> Tuple[bool, str]:
@@ -622,6 +624,8 @@ class PI05InferenceEngine(BaseInferenceEngine):
             self._max_state_dim = int(self.config_dict.get("max_state_dim", 32))
 
             pi05_config_kwargs = _coerce_pi05_config_dict(self.config_dict, str(self.device))
+            if self.smoothing_config.enable_rtc:
+                pi05_config_kwargs["rtc_config"] = make_rtc_config(self.smoothing_config)
             self.config = PI05Config(**pi05_config_kwargs)
             self._image_resize = tuple(self.config.image_resolution) if self.config.image_resolution is not None else None
             self._max_state_dim = int(self.config.max_state_dim)
@@ -632,7 +636,10 @@ class PI05InferenceEngine(BaseInferenceEngine):
                     trust_remote_code=True,
                 )
 
-            self.model = PI05Pytorch(self.config, rtc_processor=None)
+            self.model = PI05Pytorch(
+                self.config,
+                rtc_processor=make_rtc_processor(self.smoothing_config),
+            )
             self.model.to(self.device)
             self.model.eval()
 
@@ -734,9 +741,14 @@ class PI05InferenceEngine(BaseInferenceEngine):
         self._instruction = instruction
         if self._action_queue is not None:
             self._action_queue.reset()
+        self._rtc_prev_chunk_left_over = None
 
         logger.info("Instruction set: %s", instruction)
         return True
+
+    def reset(self):
+        super().reset()
+        self._rtc_prev_chunk_left_over = None
 
     def get_instruction(self) -> str:
         """Get current instruction."""
@@ -860,13 +872,31 @@ class PI05InferenceEngine(BaseInferenceEngine):
             img_masks=image_masks,
             tokens=tokens,
             masks=masks,
+            **self._rtc_kwargs(),
         )
 
+        self._update_rtc_left_over(actions_chunk)
         actions_normalized = actions_chunk[0, :self.n_action_steps, :self.action_dim]
         actions = np.stack(
             [self._postprocess_action(actions_normalized[i]) for i in range(actions_normalized.shape[0])]
         )
         return actions
+
+    def _rtc_kwargs(self) -> Dict[str, Any]:
+        if not self.smoothing_config.enable_rtc:
+            return {}
+        return {
+            "prev_chunk_left_over": self._rtc_prev_chunk_left_over,
+            "inference_delay": int(self.smoothing_config.rtc_inference_delay_steps),
+            "execution_horizon": int(self.smoothing_config.rtc_execution_horizon),
+        }
+
+    def _update_rtc_left_over(self, actions_chunk: torch.Tensor) -> None:
+        if not self.smoothing_config.enable_rtc:
+            return
+        delay = max(0, int(self.smoothing_config.rtc_inference_delay_steps))
+        chunk = actions_chunk.detach()
+        self._rtc_prev_chunk_left_over = chunk[:, delay:].clone() if delay else chunk.clone()
 
     def unload(self):
         """Unload model and free memory."""

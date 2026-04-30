@@ -75,7 +75,7 @@ python examples/validate_dataset_inference.py \
 - 没有请求时间集成和异步推理时，自动走 `raw`
 - 传了 `--temporal-ensemble` 或 `--enable-async-inference` 时，自动切到 `step`
 
-如果传了 `--temporal-ensemble`，脚本会在验证时对 `predict_chunk()` 的重叠未来动作做指数加权融合。
+如果传了 `--temporal-ensemble`，脚本会开启 SDK 内 ACT engine 的 LeRobot 风格时间集成，并通过 `step()` 验证控制环真实输出。
 
 默认系数是 `0.01`。如果要覆盖它，再额外传：
 
@@ -87,9 +87,11 @@ python examples/validate_dataset_inference.py \
 
 - `--temporal-ensemble-coeff` 不能单独使用
 - 不传 `--temporal-ensemble` 就代表关闭时间集成
+- `--temporal-ensemble` 只支持 ACT
 - 如果显式指定 `--execution-mode raw`，就不能再传 `--temporal-ensemble`
 - 如果显式指定 `--execution-mode raw`，就不能再传 `--enable-async-inference`
 - 当前 example 中，`--temporal-ensemble` 和 `--enable-async-inference` 不能同时开启
+- `--enable-rtc` 只支持 `smolvla`、`pi0`、`pi05`，不传就保持关闭
 
 ## 常用示例
 
@@ -167,6 +169,26 @@ python examples/validate_dataset_inference.py \
 - `PI0`、`PI0.5` 和 `SmolVLA` 可以通过 `--instruction` 显式传入指令。
 - 如果不传，脚本会优先使用数据集样本里的 `task` 字段。
 
+### 2.1 验证开启 RTC 的 PI0 / PI0.5 / SmolVLA
+
+```bash
+python examples/validate_dataset_inference.py \
+  --model /path/to/pi05_checkpoint \
+  --model-type pi05 \
+  --dataset /path/to/lerobot_dataset \
+  --episode 0 \
+  --instruction "pick and place" \
+  --enable-rtc \
+  --rtc-prefix-attention-schedule LINEAR \
+  --rtc-execution-horizon 10 \
+  --rtc-inference-delay-steps 0
+```
+
+说明：
+
+- `--enable-rtc` 只支持 `smolvla`、`pi0`、`pi05`
+- `--rtc-inference-delay-steps` 是静态控制步延迟，默认 `0`
+
 ### 3. 验证全部 episode
 
 ```bash
@@ -198,8 +220,11 @@ python examples/validate_dataset_inference.py \
 - `--device`：推理设备，例如 `cuda:0` 或 `cpu`
 - `--instruction`：语言指令，主要用于 `pi0` / `pi05` / `smolvla`
 - `--execution-mode`：`auto` / `raw` / `step`
-- `--temporal-ensemble`：对重叠 chunk 动作做指数加权融合
-- `--temporal-ensemble-coeff`：时间集成系数，默认 `0.01`，必须和 `--temporal-ensemble` 一起使用
+- `--temporal-ensemble`：开启 SDK ACT 时间集成，只支持 `act` + `step`/`auto`
+- `--temporal-ensemble-coeff`：ACT 时间集成系数，默认 `0.01`，必须和 `--temporal-ensemble` 一起使用
+- `--enable-rtc`：为 `smolvla` / `pi0` / `pi05` 开启 RTC
+- `--rtc-prefix-attention-schedule`：RTC 前缀注意力权重，支持 `ZEROS`、`ONES`、`LINEAR`、`EXP`
+- `--rtc-execution-horizon` / `--rtc-inference-delay-steps`：RTC 执行窗口和静态推理延迟步数
 - `--enable-async-inference`：在 `step` 模式下启动异步推理线程
 - `--output-dir`：自定义输出目录
 - `--dataset-gripper-scale`：夹爪值缩放模式，通常保留默认 `auto`

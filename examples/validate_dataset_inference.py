@@ -208,13 +208,53 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--temporal-ensemble",
         action="store_true",
-        help="Enable generic temporal ensembling for chunk policies. Effective only in step mode.",
+        help="Enable SDK ACT temporal ensembling. Effective only for ACT in step mode.",
     )
     parser.add_argument(
         "--temporal-ensemble-coeff",
         type=float,
         default=None,
-        help="Temporal ensembling coefficient. Only used together with --temporal-ensemble in step mode. Default: 0.01.",
+        help="ACT temporal ensembling coefficient. Default: 0.01 when --temporal-ensemble is set.",
+    )
+    parser.add_argument(
+        "--enable-rtc",
+        action="store_true",
+        help="Enable RTC for SmolVLA/PI0/PI0.5 policies.",
+    )
+    parser.add_argument(
+        "--rtc-prefix-attention-schedule",
+        choices=["ZEROS", "ONES", "LINEAR", "EXP", "zeros", "ones", "linear", "exp"],
+        default="LINEAR",
+        help="RTC prefix attention schedule. Default: LINEAR.",
+    )
+    parser.add_argument(
+        "--rtc-max-guidance-weight",
+        type=float,
+        default=10.0,
+        help="RTC max guidance weight. Default: 10.0.",
+    )
+    parser.add_argument(
+        "--rtc-execution-horizon",
+        type=int,
+        default=10,
+        help="RTC execution horizon. Default: 10.",
+    )
+    parser.add_argument(
+        "--rtc-inference-delay-steps",
+        type=int,
+        default=0,
+        help="Static RTC inference delay in control steps. Default: 0.",
+    )
+    parser.add_argument(
+        "--rtc-debug",
+        action="store_true",
+        help="Enable RTC debug tracking in SparkMind's RTCProcessor.",
+    )
+    parser.add_argument(
+        "--rtc-debug-maxlen",
+        type=int,
+        default=100,
+        help="Maximum RTC debug records to keep. Default: 100.",
     )
     parser.add_argument(
         "--enable-async-inference",
@@ -324,35 +364,6 @@ class EpisodeResult:
     average_call_ms: float
     plot_path: str = ""
     csv_path: str = ""
-
-
-@dataclass
-class TemporalEnsembler:
-    coeff: float
-
-    def __post_init__(self) -> None:
-        self._pending: dict[int, list[tuple[int, np.ndarray]]] = {}
-
-    def reset(self) -> None:
-        self._pending.clear()
-
-    def step(self, timestep: int, chunk: np.ndarray) -> np.ndarray:
-        chunk_array = np.asarray(chunk, dtype=np.float32)
-        if chunk_array.ndim != 2:
-            raise ValueError(f"Expected chunk shape [steps, action_dim], got {chunk_array.shape}")
-
-        for offset, action in enumerate(chunk_array):
-            target_timestep = timestep + offset
-            self._pending.setdefault(target_timestep, []).append((timestep, action.copy()))
-
-        candidates = self._pending.pop(timestep, [])
-        if not candidates:
-            return chunk_array[0]
-
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        weights = np.exp(-self.coeff * np.arange(len(candidates), dtype=np.float32))
-        actions = np.stack([action for _, action in candidates], axis=0)
-        return np.average(actions, axis=0, weights=weights)
 
 
 def _normalize_local_model_dir(path: Path) -> Path:
@@ -582,6 +593,18 @@ def _load_engine(model_type: str, model_dir: Path, args: argparse.Namespace, con
         control_fps=control_fps,
         enable_async_inference=False,
         aggregate_fn_name="latest_only",
+        enable_temporal_ensemble=args.temporal_ensemble,
+        temporal_ensemble_coeff=(
+            0.01 if args.temporal_ensemble and args.temporal_ensemble_coeff is None
+            else (args.temporal_ensemble_coeff or 0.01)
+        ),
+        enable_rtc=args.enable_rtc,
+        rtc_prefix_attention_schedule=args.rtc_prefix_attention_schedule,
+        rtc_max_guidance_weight=args.rtc_max_guidance_weight,
+        rtc_execution_horizon=args.rtc_execution_horizon,
+        rtc_inference_delay_steps=args.rtc_inference_delay_steps,
+        rtc_debug=args.rtc_debug,
+        rtc_debug_maxlen=args.rtc_debug_maxlen,
     )
     engine = create_engine(
         model_type=model_type,
@@ -621,6 +644,13 @@ def _load_async_runtime(
             control_fps=control_fps,
             chunk_size_threshold=0.5,
             aggregate_fn_name="weighted_average",
+            enable_rtc=args.enable_rtc,
+            rtc_prefix_attention_schedule=args.rtc_prefix_attention_schedule,
+            rtc_max_guidance_weight=args.rtc_max_guidance_weight,
+            rtc_execution_horizon=args.rtc_execution_horizon,
+            rtc_inference_delay_steps=args.rtc_inference_delay_steps,
+            rtc_debug=args.rtc_debug,
+            rtc_debug_maxlen=args.rtc_debug_maxlen,
         ),
     )
     return runtime, _metadata_from_policy_metadata(metadata)
@@ -757,7 +787,6 @@ def _run_episode_validation(
     gripper_mode: str,
     explicit_instruction: str | None,
     execution_mode: str,
-    temporal_ensemble_coeff: float | None,
 ) -> EpisodeResult:
     action_dim = int(metadata.action_dim)
     accumulator = ErrorAccumulator(action_dim=action_dim)
@@ -766,7 +795,6 @@ def _run_episode_validation(
     frame_indices: list[int] = []
     task = ""
     total_call_ms = 0.0
-    temporal_ensembler = TemporalEnsembler(coeff=temporal_ensemble_coeff) if temporal_ensemble_coeff is not None else None
     async_started = False
 
     if async_runtime is not None:
@@ -775,9 +803,6 @@ def _run_episode_validation(
         engine.reset()
     else:
         raise ValueError("Either engine or async_runtime must be provided")
-
-    if temporal_ensembler is not None:
-        temporal_ensembler.reset()
 
     first_item = dataset[int(dataset_indices[0])]
     episode_instruction = _resolve_instruction(model_type, explicit_instruction, first_item)
@@ -816,9 +841,6 @@ def _run_episode_validation(
                     state=observation.state,
                     instruction=instruction,
                 ).action
-            elif temporal_ensembler is not None:
-                chunk = engine.predict_chunk(observation.images, observation.state)
-                predicted_first = temporal_ensembler.step(position - 1, chunk)
             elif execution_mode == "step":
                 predicted_first = engine.step(observation.images, observation.state)
             else:
@@ -886,6 +908,7 @@ def _print_run_header(
     resolved_execution_mode: str,
     async_inference_enabled: bool,
     temporal_ensemble_coeff: float | None,
+    rtc_enabled: bool,
 ) -> None:
     print("=" * 80)
     print("SDK Episode Validation")
@@ -902,6 +925,7 @@ def _print_run_header(
     print(f"Device: {device}")
     print(f"Execution mode: requested={requested_execution_mode} resolved={resolved_execution_mode}")
     print(f"Async inference: {'enabled' if async_inference_enabled else 'disabled'}")
+    print(f"RTC: {'enabled' if rtc_enabled else 'disabled'}")
     print(
         "Temporal ensembling: "
         + (
@@ -953,7 +977,10 @@ def main() -> int:
     if args.temporal_ensemble_coeff is not None and not args.temporal_ensemble:
         raise ValueError("`--temporal-ensemble-coeff` requires `--temporal-ensemble`")
 
-    temporal_ensemble_coeff = 0.01 if args.temporal_ensemble and args.temporal_ensemble_coeff is None else args.temporal_ensemble_coeff
+    temporal_ensemble_coeff = (
+        0.01 if args.temporal_ensemble and args.temporal_ensemble_coeff is None
+        else args.temporal_ensemble_coeff
+    )
     execution_mode = _resolve_execution_mode(args)
     if args.execution_mode == "raw" and args.temporal_ensemble:
         raise ValueError("`--temporal-ensemble` requires `--execution-mode step` or `--execution-mode auto`")
@@ -976,6 +1003,19 @@ def main() -> int:
     model_dir, model_label = _resolve_model_source(args.model)
     dataset_root, dataset_label = _resolve_dataset_source(args.dataset)
     model_type = _resolve_model_type(args.model_type, model_dir)
+    if args.temporal_ensemble and model_type != "act":
+        raise ValueError("`--temporal-ensemble` is only supported for ACT")
+    if args.enable_rtc and model_type not in {"smolvla", "pi0", "pi05"}:
+        raise ValueError("`--enable-rtc` is only supported for SmolVLA, PI0 and PI0.5")
+    if args.rtc_max_guidance_weight <= 0.0:
+        raise ValueError("`--rtc-max-guidance-weight` must be > 0")
+    if args.rtc_execution_horizon < 1:
+        raise ValueError("`--rtc-execution-horizon` must be >= 1")
+    if args.rtc_inference_delay_steps < 0:
+        raise ValueError("`--rtc-inference-delay-steps` must be >= 0")
+    if args.rtc_debug_maxlen < 1:
+        raise ValueError("`--rtc-debug-maxlen` must be >= 1")
+
     dataset_repo_id = _dataset_repo_id_for_source(args.dataset, dataset_root)
 
     LeRobotDataset = _load_dataset_class()
@@ -1023,6 +1063,7 @@ def main() -> int:
             resolved_execution_mode=execution_mode,
             async_inference_enabled=args.enable_async_inference,
             temporal_ensemble_coeff=temporal_ensemble_coeff,
+            rtc_enabled=args.enable_rtc,
         )
 
         episode_results: list[EpisodeResult] = []
@@ -1049,7 +1090,6 @@ def main() -> int:
                 gripper_mode=gripper_mode,
                 explicit_instruction=args.instruction,
                 execution_mode=execution_mode,
-                temporal_ensemble_coeff=temporal_ensemble_coeff,
             )
 
             for prediction, target in zip(result.predictions, result.targets, strict=True):
@@ -1099,6 +1139,11 @@ def main() -> int:
         "async_inference_enabled": args.enable_async_inference,
         "temporal_ensemble_enabled": args.temporal_ensemble,
         "temporal_ensemble_coeff": temporal_ensemble_coeff,
+        "rtc_enabled": args.enable_rtc,
+        "rtc_prefix_attention_schedule": args.rtc_prefix_attention_schedule,
+        "rtc_max_guidance_weight": args.rtc_max_guidance_weight,
+        "rtc_execution_horizon": args.rtc_execution_horizon,
+        "rtc_inference_delay_steps": args.rtc_inference_delay_steps,
         "episodes": [
             {
                 "episode_index": result.episode_index,

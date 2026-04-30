@@ -44,6 +44,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--chunk-size-threshold", type=float, default=0.5)
     parser.add_argument("--aggregate-fn", default="weighted_average")
+    parser.add_argument("--enable-rtc", action="store_true", help="Enable RTC for SmolVLA/PI0/PI0.5 policies.")
+    parser.add_argument(
+        "--rtc-prefix-attention-schedule",
+        choices=["ZEROS", "ONES", "LINEAR", "EXP", "zeros", "ones", "linear", "exp"],
+        default="LINEAR",
+        help="RTC prefix attention schedule. Default: LINEAR.",
+    )
+    parser.add_argument("--rtc-max-guidance-weight", type=float, default=10.0)
+    parser.add_argument("--rtc-execution-horizon", type=int, default=10)
+    parser.add_argument("--rtc-inference-delay-steps", type=int, default=0)
+    parser.add_argument("--rtc-debug", action="store_true")
+    parser.add_argument("--rtc-debug-maxlen", type=int, default=100)
     parser.add_argument(
         "--fallback-mode",
         choices=["hold", "repeat"],
@@ -78,6 +90,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.enable_rtc and args.model_type not in {"smolvla", "pi0", "pi05"}:
+        raise ValueError("--enable-rtc is only supported for SmolVLA, PI0 and PI0.5")
+
     runtime = get_global_async_runtime()
 
     runtime.load_policy(
@@ -90,6 +105,13 @@ def main() -> None:
             chunk_size_threshold=args.chunk_size_threshold,
             aggregate_fn_name=args.aggregate_fn,
             fallback_mode=args.fallback_mode,
+            enable_rtc=args.enable_rtc,
+            rtc_prefix_attention_schedule=args.rtc_prefix_attention_schedule,
+            rtc_max_guidance_weight=args.rtc_max_guidance_weight,
+            rtc_execution_horizon=args.rtc_execution_horizon,
+            rtc_inference_delay_steps=args.rtc_inference_delay_steps,
+            rtc_debug=args.rtc_debug,
+            rtc_debug_maxlen=args.rtc_debug_maxlen,
         ),
     )
 

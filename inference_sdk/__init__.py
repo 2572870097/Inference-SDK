@@ -44,6 +44,7 @@ configure_optional_import_paths()
 
 from .base import (  # noqa: E402
     AGGREGATE_FUNCTIONS,
+    ACTTemporalEnsembler,
     BaseInferenceEngine,
     GripperSmoother,
     LatencyEstimator,
@@ -91,6 +92,7 @@ from .factory import (  # noqa: E402
 __all__ = [
     "AGGREGATE_FUNCTIONS",
     "ACTInferenceEngine",
+    "ACTTemporalEnsembler",
     "ACT_AVAILABLE",
     "AsyncInferenceConfig",
     "AsyncInferenceRuntime",

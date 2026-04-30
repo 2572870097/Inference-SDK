@@ -155,6 +155,21 @@ class SmoothingConfig:
     # Legacy compatibility flags (not used by direct engine execution)
     fully_async: bool = False
     enable_async_prefetch: bool = False
+
+    # ACT temporal ensembling. Matches LeRobot's ACT temporal ensemble
+    # behavior when enabled by ACTInferenceEngine.select_action().
+    enable_temporal_ensemble: bool = False
+    temporal_ensemble_coeff: float = 0.01
+
+    # Real-Time Chunking (RTC) options for VLA policies that support it
+    # (SmolVLA, PI0 and PI0.5). Disabled by default.
+    enable_rtc: bool = False
+    rtc_prefix_attention_schedule: str = "LINEAR"
+    rtc_max_guidance_weight: float = 10.0
+    rtc_execution_horizon: int = 10
+    rtc_inference_delay_steps: int = 0
+    rtc_debug: bool = False
+    rtc_debug_maxlen: int = 100
     
     @property
     def environment_dt(self) -> float:
@@ -539,6 +554,56 @@ class GripperSmoother:
         return self._last_action.copy() if self._last_action is not None else None
 
 
+class ACTTemporalEnsembler:
+    """LeRobot-style online temporal ensemble for ACT action chunks."""
+
+    def __init__(self, temporal_ensemble_coeff: float, chunk_size: int):
+        self.chunk_size = max(1, int(chunk_size))
+        steps = np.arange(self.chunk_size, dtype=np.float32)
+        self.ensemble_weights = np.exp(-float(temporal_ensemble_coeff) * steps).astype(np.float32)
+        self.ensemble_weights_cumsum = np.cumsum(self.ensemble_weights).astype(np.float32)
+        self.reset()
+
+    def reset(self):
+        self.ensembled_actions: Optional[np.ndarray] = None
+        self.ensembled_actions_count: Optional[np.ndarray] = None
+
+    def update(self, actions: np.ndarray) -> np.ndarray:
+        """Update the ensemble with a new chunk and return the current action."""
+        action_chunk = np.asarray(actions, dtype=np.float32)
+        if action_chunk.ndim != 2:
+            raise ValueError(f"actions must have shape (chunk_size, action_dim), got {action_chunk.shape}")
+        if action_chunk.shape[0] == 0:
+            raise ValueError("actions chunk must not be empty")
+
+        if self.ensembled_actions is None or self.ensembled_actions_count is None:
+            self.ensembled_actions = action_chunk.copy()
+            self.ensembled_actions_count = np.ones((action_chunk.shape[0], 1), dtype=np.int64)
+        else:
+            overlap = min(self.ensembled_actions.shape[0], max(0, action_chunk.shape[0] - 1))
+            if overlap > 0:
+                counts = np.clip(self.ensembled_actions_count[:overlap], 1, self.chunk_size - 1)
+                self.ensembled_actions[:overlap] *= self.ensemble_weights_cumsum[counts - 1]
+                self.ensembled_actions[:overlap] += action_chunk[:overlap] * self.ensemble_weights[counts]
+                self.ensembled_actions[:overlap] /= self.ensemble_weights_cumsum[counts]
+                self.ensembled_actions_count[:overlap] = np.clip(counts + 1, 1, self.chunk_size)
+
+            self.ensembled_actions = np.concatenate(
+                [self.ensembled_actions[:overlap], action_chunk[overlap:].copy()],
+                axis=0,
+            )
+            tail_count = np.ones((action_chunk.shape[0] - overlap, 1), dtype=np.int64)
+            self.ensembled_actions_count = np.concatenate(
+                [self.ensembled_actions_count[:overlap], tail_count],
+                axis=0,
+            )
+
+        action = self.ensembled_actions[0].copy()
+        self.ensembled_actions = self.ensembled_actions[1:]
+        self.ensembled_actions_count = self.ensembled_actions_count[1:]
+        return action
+
+
 # ==================== Base Inference Engine ====================
 
 class BaseInferenceEngine(ABC):
@@ -570,6 +635,7 @@ class BaseInferenceEngine(ABC):
         self._action_queue: Optional[TimestampedActionQueue] = None
         self._latency_estimator: Optional[LatencyEstimator] = None
         self._gripper_smoother: Optional[GripperSmoother] = None
+        self._temporal_ensembler: Optional[ACTTemporalEnsembler] = None
         self._trace_recorder: Optional[TraceRecorder] = None
         
         # Episode state
@@ -591,6 +657,7 @@ class BaseInferenceEngine(ABC):
             self.smoothing_config,
             self.action_dim
         )
+        self._temporal_ensembler = None
     
     @abstractmethod
     def load(self, checkpoint_dir: str) -> Tuple[bool, str]:
@@ -618,6 +685,8 @@ class BaseInferenceEngine(ABC):
             self._action_queue.reset()
         if self._gripper_smoother is not None:
             self._gripper_smoother.reset()
+        if self._temporal_ensembler is not None:
+            self._temporal_ensembler.reset()
         
         # Reset episode state
         self._episode_start_time = time.time()

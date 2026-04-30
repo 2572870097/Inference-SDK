@@ -25,6 +25,7 @@ import yaml
 from ..base import BaseInferenceEngine, SmoothingConfig
 from ..device import resolve_torch_device
 from ..runtime import format_optional_dependency_error, iter_model_search_roots, iter_unique_paths
+from .rtc import make_rtc_config, make_rtc_processor
 
 logger = logging.getLogger(__name__)
 
@@ -333,6 +334,7 @@ class SmolVLAInferenceEngine(BaseInferenceEngine):
         
         # Image resize target for SmolVLA. If None, keep native resolution.
         self._image_resize: Optional[Tuple[int, int]] = (512, 512)
+        self._rtc_prev_chunk_left_over: Optional[torch.Tensor] = None
 
     @staticmethod
     def validate_checkpoint(checkpoint_dir: str) -> Tuple[bool, str]:
@@ -454,6 +456,8 @@ class SmolVLAInferenceEngine(BaseInferenceEngine):
             filtered_config = {k: v for k, v in self.config_dict.items() if k in valid_config_keys}
             filtered_config["load_vlm_weights"] = False  # Load from checkpoint instead
             filtered_config["vlm_model_name"] = vlm_model_source
+            if self.smoothing_config.enable_rtc:
+                filtered_config["rtc_config"] = make_rtc_config(self.smoothing_config)
             
             # Handle tuple conversion for resize_imgs_with_padding
             if "resize_imgs_with_padding" in filtered_config:
@@ -476,7 +480,10 @@ class SmolVLAInferenceEngine(BaseInferenceEngine):
                 )
                 
                 # Initialize model
-                self.model = VLAFlowMatching(self.config)
+                self.model = VLAFlowMatching(
+                    self.config,
+                    rtc_processor=make_rtc_processor(self.smoothing_config),
+                )
 
             self.model.to(self.device)
             self.model.eval()
@@ -528,9 +535,14 @@ class SmolVLAInferenceEngine(BaseInferenceEngine):
         # Reset action queue when instruction changes
         if self._action_queue is not None:
             self._action_queue.reset()
+        self._rtc_prev_chunk_left_over = None
         
         logger.info(f"Instruction set: {instruction}")
         return True
+
+    def reset(self):
+        super().reset()
+        self._rtc_prev_chunk_left_over = None
     
     def get_instruction(self) -> str:
         """Get current instruction."""
@@ -718,9 +730,11 @@ class SmolVLAInferenceEngine(BaseInferenceEngine):
             lang_tokens=self._instruction_tokens,
             lang_masks=self._instruction_attention_mask,
             state=padded_state,
+            **self._rtc_kwargs(),
         )  # (1, chunk_size, max_action_dim)
         
         # Take n_action_steps actions, only action_dim dimensions
+        self._update_rtc_left_over(actions_chunk)
         actions_normalized = actions_chunk[0, :self.n_action_steps, :self.action_dim]
         
         # Postprocess all actions
@@ -730,6 +744,22 @@ class SmolVLAInferenceEngine(BaseInferenceEngine):
         ])
         
         return actions
+
+    def _rtc_kwargs(self) -> Dict[str, Any]:
+        if not self.smoothing_config.enable_rtc:
+            return {}
+        return {
+            "prev_chunk_left_over": self._rtc_prev_chunk_left_over,
+            "inference_delay": int(self.smoothing_config.rtc_inference_delay_steps),
+            "execution_horizon": int(self.smoothing_config.rtc_execution_horizon),
+        }
+
+    def _update_rtc_left_over(self, actions_chunk: torch.Tensor) -> None:
+        if not self.smoothing_config.enable_rtc:
+            return
+        delay = max(0, int(self.smoothing_config.rtc_inference_delay_steps))
+        chunk = actions_chunk.detach()
+        self._rtc_prev_chunk_left_over = chunk[:, delay:].clone() if delay else chunk.clone()
     
     def unload(self):
         """Unload model and free memory."""

@@ -9,6 +9,7 @@ Implements action queue based inference following LeRobot pattern:
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -17,7 +18,7 @@ import numpy as np
 import torch
 import yaml
 
-from ..base import BaseInferenceEngine, SmoothingConfig
+from ..base import ACTTemporalEnsembler, BaseInferenceEngine, SmoothingConfig
 from ..device import resolve_torch_device
 from ..runtime import format_optional_dependency_error
 
@@ -354,6 +355,11 @@ class ACTInferenceEngine(BaseInferenceEngine):
             
             # Initialize all components (queue, latency estimator, gripper smoother)
             self._init_components()
+            if self.smoothing_config.enable_temporal_ensemble:
+                self._temporal_ensembler = ACTTemporalEnsembler(
+                    temporal_ensemble_coeff=self.smoothing_config.temporal_ensemble_coeff,
+                    chunk_size=self.n_action_steps,
+                )
             self.reset()
             
             return True, ""
@@ -512,6 +518,36 @@ class ACTInferenceEngine(BaseInferenceEngine):
         ])
         
         return actions
+
+    def select_action(self, images: Dict[str, np.ndarray], state: np.ndarray) -> np.ndarray:
+        """Select one action, optionally using LeRobot-style ACT temporal ensembling."""
+        if not self.smoothing_config.enable_temporal_ensemble:
+            return super().select_action(images, state)
+
+        if not self.is_loaded:
+            raise RuntimeError("Model not loaded")
+        if self._temporal_ensembler is None:
+            self._temporal_ensembler = ACTTemporalEnsembler(
+                temporal_ensemble_coeff=self.smoothing_config.temporal_ensemble_coeff,
+                chunk_size=self.n_action_steps,
+            )
+
+        current_time = time.time()
+        elapsed_since_reset = max(0.0, current_time - self._episode_start_time)
+        self._current_timestep = int(elapsed_since_reset / self.smoothing_config.environment_dt)
+
+        start_time = time.perf_counter()
+        action_chunk = self._predict_chunk(images, state)
+        elapsed = time.perf_counter() - start_time
+        if self._latency_estimator is not None:
+            self._latency_estimator.update(elapsed)
+
+        action = self._temporal_ensembler.update(action_chunk)
+
+        if self._gripper_smoother is not None:
+            action = self._gripper_smoother.smooth(action)
+
+        return action
     
     def unload(self):
         """Unload model and free memory."""

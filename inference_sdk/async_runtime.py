@@ -66,6 +66,15 @@ class AsyncInferenceConfig:
     action_max: Optional[float | np.ndarray] = None
     clip_action: bool = False
     trace_max_events: int = 1000
+    enable_temporal_ensemble: bool = False
+    temporal_ensemble_coeff: float = 0.01
+    enable_rtc: bool = False
+    rtc_prefix_attention_schedule: str = "LINEAR"
+    rtc_max_guidance_weight: float = 10.0
+    rtc_execution_horizon: int = 10
+    rtc_inference_delay_steps: int = 0
+    rtc_debug: bool = False
+    rtc_debug_maxlen: int = 100
 
     @property
     def environment_dt(self) -> float:
@@ -86,6 +95,15 @@ class AsyncInferenceConfig:
             aggregate_fn_name=self.aggregate_fn_name,
             obs_queue_maxsize=self.obs_queue_maxsize,
             fallback_mode=self.fallback_mode,
+            enable_temporal_ensemble=self.enable_temporal_ensemble,
+            temporal_ensemble_coeff=self.temporal_ensemble_coeff,
+            enable_rtc=self.enable_rtc,
+            rtc_prefix_attention_schedule=self.rtc_prefix_attention_schedule,
+            rtc_max_guidance_weight=self.rtc_max_guidance_weight,
+            rtc_execution_horizon=self.rtc_execution_horizon,
+            rtc_inference_delay_steps=self.rtc_inference_delay_steps,
+            rtc_debug=self.rtc_debug,
+            rtc_debug_maxlen=self.rtc_debug_maxlen,
         )
 
     def validate(self) -> None:
@@ -108,6 +126,16 @@ class AsyncInferenceConfig:
             raise ValueError("max_consecutive_errors must be >= 1")
         if self.trace_max_events < 1:
             raise ValueError("trace_max_events must be >= 1")
+        if self.rtc_prefix_attention_schedule.strip().upper() not in {"ZEROS", "ONES", "LINEAR", "EXP"}:
+            raise ValueError("rtc_prefix_attention_schedule must be one of: ZEROS, ONES, LINEAR, EXP")
+        if self.rtc_max_guidance_weight <= 0.0:
+            raise ValueError("rtc_max_guidance_weight must be > 0.0")
+        if self.rtc_execution_horizon < 1:
+            raise ValueError("rtc_execution_horizon must be >= 1")
+        if self.rtc_inference_delay_steps < 0:
+            raise ValueError("rtc_inference_delay_steps must be >= 0")
+        if self.rtc_debug_maxlen < 1:
+            raise ValueError("rtc_debug_maxlen must be >= 1")
         get_aggregate_function(self.aggregate_fn_name)
 
 
@@ -1086,6 +1114,15 @@ def _normalize_config(config: Optional[AsyncInferenceConfig | SmoothingConfig]) 
             latency_safety_margin=config.latency_safety_margin,
             enable_gripper_clamping=config.enable_gripper_clamping,
             gripper_max_velocity=config.gripper_max_velocity,
+            enable_temporal_ensemble=config.enable_temporal_ensemble,
+            temporal_ensemble_coeff=config.temporal_ensemble_coeff,
+            enable_rtc=config.enable_rtc,
+            rtc_prefix_attention_schedule=config.rtc_prefix_attention_schedule,
+            rtc_max_guidance_weight=config.rtc_max_guidance_weight,
+            rtc_execution_horizon=config.rtc_execution_horizon,
+            rtc_inference_delay_steps=config.rtc_inference_delay_steps,
+            rtc_debug=config.rtc_debug,
+            rtc_debug_maxlen=config.rtc_debug_maxlen,
         )
         normalized.validate()
         return normalized

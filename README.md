@@ -116,6 +116,38 @@ finally:
 - `predict_chunk()`：直接返回当前 observation 对应的完整动作 chunk，适合离线验证和曲线对比。
 - `step()` / `select_action()`：走 engine 内部动作队列，每次返回一个控制 tick 的动作。
 
+### 可选推理增强
+
+ACT 可以在同步 `engine.step()` 路径开启 LeRobot 风格时间集成。开启后每个控制 tick 都会重新预测一个 action chunk，并在线融合重叠时间步的动作：
+
+```python
+engine = create_engine(
+    model_type="act",
+    device="cuda:0",
+    smoothing_config=SmoothingConfig(
+        enable_temporal_ensemble=True,
+        temporal_ensemble_coeff=0.01,
+    ),
+)
+```
+
+SmolVLA、PI0、PI0.5 可以开启 RTC。`rtc_inference_delay_steps` 是静态延迟步数；如果你的控制环能测出实际推理延迟，可以按 tick 数传入：
+
+```python
+engine = create_engine(
+    model_type="pi05",
+    device="cuda:0",
+    smoothing_config=SmoothingConfig(
+        enable_rtc=True,
+        rtc_prefix_attention_schedule="LINEAR",
+        rtc_execution_horizon=10,
+        rtc_inference_delay_steps=0,
+    ),
+)
+```
+
+说明：ACT 时间集成当前用于同步 `engine.step()` / `select_action()`；进程内异步 runtime 仍使用 action chunk 队列和 `aggregate_fn_name` 处理重叠 chunk。
+
 ## 进程内异步推理
 
 如果需要将“动作执行”和“模型推理”解耦，可以使用 `AsyncInferenceRuntime`。它不启动 gRPC server/client，而是在当前 Python 后端进程内维护：
@@ -188,6 +220,9 @@ finally:
 - `aggregate_fn_name`：新旧动作 chunk 重叠 timestep 的融合方式，支持 `latest_only`、`weighted_average`、`average`、`conservative`。
 - `fallback_mode`：动作队列为空时的行为；`hold` 使用当前 robot state，`repeat` 重复上一条动作。
 - `enable_gripper_clamping`：是否对夹爪动作做速度限制，真机可开启，离线曲线对比时可关闭。
+- `enable_rtc`：为 SmolVLA / PI0 / PI0.5 开启 RTC。
+- `rtc_prefix_attention_schedule`：RTC 前缀注意力权重，支持 `ZEROS`、`ONES`、`LINEAR`、`EXP`。
+- `rtc_execution_horizon` / `rtc_inference_delay_steps`：RTC 执行窗口和静态推理延迟步数。
 
 ## Dataset 验证
 
@@ -223,6 +258,8 @@ python examples/validate_dataset_async_inference.py \
   --dataset /path/to/lerobot_dataset \
   --episode 0 \
   --instruction "pick and place" \
+  --enable-rtc \
+  --rtc-execution-horizon 10 \
   --debug-threads
 ```
 
