@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "inference-sdk"
 version = "0.1.0"
-description = "Standalone inference SDK for ACT, SmolVLA, and PI0 policy inference."
+description = "Standalone inference SDK for ACT, SmolVLA, PI0, and PI0.5 policy inference."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

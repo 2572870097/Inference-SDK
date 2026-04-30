@@ -57,7 +57,14 @@ def _ensure_sparkmind_path(repo_root: Path) -> Path:
 
 SPARKMIND_ROOT = _ensure_sparkmind_path(REPO_ROOT)
 
-from inference_sdk import AsyncInferenceConfig, AsyncInferenceRuntime, SUPPORTED_MODEL_TYPES, SmoothingConfig, create_engine
+from inference_sdk import (
+    AsyncInferenceConfig,
+    AsyncInferenceRuntime,
+    SUPPORTED_MODEL_TYPES,
+    SmoothingConfig,
+    create_engine,
+    normalize_model_type,
+)
 
 
 def _load_snapshot_download():
@@ -185,7 +192,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--instruction",
         default=None,
-        help="Optional explicit instruction. PI0/SmolVLA otherwise use the dataset task string.",
+        help="Optional explicit instruction. PI0/PI0.5/SmolVLA otherwise use the dataset task string.",
     )
     parser.add_argument(
         "--execution-mode",
@@ -419,14 +426,14 @@ def _infer_model_type(checkpoint_dir: Path) -> str:
         config = json.loads(config_path.read_text(encoding="utf-8"))
         model_type = str(config.get("type", "")).strip().lower()
         if model_type:
-            return model_type
+            return normalize_model_type(model_type)
 
     train_config_path = checkpoint_dir / "train_config.json"
     if train_config_path.is_file():
         train_config = json.loads(train_config_path.read_text(encoding="utf-8"))
         model_type = str(train_config.get("policy", {}).get("type", "")).strip().lower()
         if model_type:
-            return model_type
+            return normalize_model_type(model_type)
 
     raise ValueError(f"Could not infer model type from {checkpoint_dir}")
 
@@ -436,7 +443,7 @@ def _resolve_model_type(explicit_model_type: str | None, checkpoint_dir: Path) -
     if explicit_model_type is None:
         return inferred_model_type
 
-    requested_model_type = explicit_model_type.strip().lower()
+    requested_model_type = normalize_model_type(explicit_model_type)
     if requested_model_type != inferred_model_type:
         raise ValueError(
             "Explicit model type does not match checkpoint config: "
@@ -518,7 +525,7 @@ def _resolve_image_key(item: dict[str, Any], required_camera: str) -> str:
 def _resolve_instruction(model_type: str, explicit_instruction: str | None, item: dict[str, Any]) -> str | None:
     if explicit_instruction is not None:
         return explicit_instruction
-    if model_type in {"pi0", "smolvla"}:
+    if model_type in {"pi0", "pi05", "smolvla"}:
         task = item.get("task")
         return str(task) if task is not None else None
     return None

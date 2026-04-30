@@ -8,10 +8,11 @@ from .base import BaseInferenceEngine, SmoothingConfig
 from .policy import (
     ACTInferenceEngine,
     PI0InferenceEngine,
+    PI05InferenceEngine,
     SmolVLAInferenceEngine,
 )
 
-SUPPORTED_MODEL_TYPES = ("act", "smolvla", "pi0")
+SUPPORTED_MODEL_TYPES = ("act", "smolvla", "pi0", "pi05")
 MODEL_TYPE_ALIASES = {
     "act": "act",
     "smolvla": "smolvla",
@@ -20,6 +21,12 @@ MODEL_TYPE_ALIASES = {
     "pi0": "pi0",
     "pi_0": "pi0",
     "pi-0": "pi0",
+    "pi05": "pi05",
+    "pi0.5": "pi05",
+    "pi0_5": "pi05",
+    "pi0-5": "pi05",
+    "pi_05": "pi05",
+    "pi-05": "pi05",
 }
 
 
@@ -44,7 +51,7 @@ def create_engine(
     Create an inference engine by model type.
 
     Args:
-        model_type: "act", "smolvla", or "pi0"
+        model_type: "act", "smolvla", "pi0", or "pi05"
         device: Requested torch device string
         smoothing_config: Optional smoothing configuration
         strict_device: If True, fail instead of silently falling back
@@ -70,6 +77,12 @@ def create_engine(
         )
     if normalized == "pi0":
         return PI0InferenceEngine(
+            device=device,
+            smoothing_config=smoothing_config,
+            strict_device=strict_device,
+        )
+    if normalized == "pi05":
+        return PI05InferenceEngine(
             device=device,
             smoothing_config=smoothing_config,
             strict_device=strict_device,

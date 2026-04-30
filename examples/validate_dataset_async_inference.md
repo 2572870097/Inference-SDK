@@ -75,6 +75,7 @@ python examples/validate_dataset_async_inference.py \
 - `act`
 - `smolvla`
 - `pi0`
+- `pi05`
 
 如果不传 `--model-type`，脚本会尝试从模型配置自动推断。
 
@@ -129,7 +130,7 @@ python examples/validate_dataset_async_inference.py \
 
 说明：
 
-- `pi0` 和 `smolvla` 通常需要语言指令
+- `pi0`、`pi05` 和 `smolvla` 通常需要语言指令
 - 如果不传 `--instruction`，脚本会优先使用数据集样本里的 `task` 字段
 
 ### 3. 验证全部 episode
@@ -193,13 +194,13 @@ python examples/validate_dataset_async_inference.py \
 ## 常用参数
 
 - `--model`：模型目录，或 Hugging Face 模型 repo id
-- `--model-type`：算法类型，支持 `act`、`smolvla`、`pi0`
+- `--model-type`：算法类型，支持 `act`、`smolvla`、`pi0`、`pi05`
 - `--dataset`：LeRobot 数据集根目录，或 Hugging Face dataset repo id
 - `--episode`：指定单个 episode
 - `--all-episodes`：验证全部 episode
 - `--device`：推理设备，例如 `cuda:0` 或 `cpu`
 - `--output-dir`：自定义输出目录
-- `--instruction`：显式语言指令，主要用于 `pi0` / `smolvla`
+- `--instruction`：显式语言指令，主要用于 `pi0` / `pi05` / `smolvla`
 - `--chunk-size-threshold`：动作队列填充比例阈值，默认 `0.5`
 - `--aggregate-fn`：重叠 chunk 的动作聚合策略，默认 `weighted_average`
 - `--dataset-gripper-scale`：夹爪值缩放模式，支持 `auto`、`normalized`、`raw`
@@ -286,7 +287,7 @@ Dataset action dim (...) does not match model action dim (...)
 
 ### 4. 指令模型效果异常
 
-对于 `pi0` 和 `smolvla`，请先确认：
+对于 `pi0`、`pi05` 和 `smolvla`，请先确认：
 
 - 传入的 `--instruction` 是否和训练数据语义一致
 - 数据集样本里的 `task` 字段是否正确

@@ -74,7 +74,7 @@ class InferenceSDK:
         Load and cache one policy by algorithm type.
 
         Args:
-            algorithm_type: "act", "smolvla", "smol-vla", or "pi0"
+            algorithm_type: "act", "smolvla", "smol-vla", "pi0", or "pi05"
             checkpoint_dir: Checkpoint directory for the selected policy
             instruction: Optional language instruction for VLA policies
             force_reload: Reload even if this policy/checkpoint is already cached

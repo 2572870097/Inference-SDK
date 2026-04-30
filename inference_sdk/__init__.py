@@ -1,5 +1,5 @@
 """
-Inference SDK package for ACT, SmolVLA and PI0 models.
+Inference SDK package for ACT, SmolVLA, PI0 and PI0.5 models.
 
 Provides optimized inference with LeRobot-style async architecture:
 - Timestamp-aligned action queue (skip expired actions)
@@ -74,9 +74,11 @@ from .async_runtime import (  # noqa: E402
 from .policy import (  # noqa: E402
     ACT_AVAILABLE,
     PI0_AVAILABLE,
+    PI05_AVAILABLE,
     SMOLVLA_AVAILABLE,
     ACTInferenceEngine,
     PI0InferenceEngine,
+    PI05InferenceEngine,
     SmolVLAInferenceEngine,
 )
 from .factory import (  # noqa: E402
@@ -101,6 +103,8 @@ __all__ = [
     "ObservationQueue",
     "PI0InferenceEngine",
     "PI0_AVAILABLE",
+    "PI05InferenceEngine",
+    "PI05_AVAILABLE",
     "CheckpointNotFoundError",
     "DeviceUnavailableError",
     "InferenceRuntimeError",

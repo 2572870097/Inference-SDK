@@ -57,6 +57,7 @@ python examples/validate_dataset_inference.py \
 
 - `act`
 - `pi0`
+- `pi05`
 - `smolvla`
 
 如果不传 `--model-type`，脚本会尝试从模型目录里的配置自动推断。
@@ -163,7 +164,7 @@ python examples/validate_dataset_inference.py \
 
 说明：
 
-- `PI0` 和 `SmolVLA` 可以通过 `--instruction` 显式传入指令。
+- `PI0`、`PI0.5` 和 `SmolVLA` 可以通过 `--instruction` 显式传入指令。
 - 如果不传，脚本会优先使用数据集样本里的 `task` 字段。
 
 ### 3. 验证全部 episode
@@ -190,12 +191,12 @@ python examples/validate_dataset_inference.py \
 ## 常用参数
 
 - `--model`：模型目录，或 Hugging Face 模型 repo id
-- `--model-type`：算法类型，支持 `act`、`pi0`、`smolvla`
+- `--model-type`：算法类型，支持 `act`、`pi0`、`pi05`、`smolvla`
 - `--dataset`：LeRobot 数据集根目录，或 Hugging Face dataset repo id
 - `--episode`：指定单个 episode
 - `--all-episodes`：验证全部 episode
 - `--device`：推理设备，例如 `cuda:0` 或 `cpu`
-- `--instruction`：语言指令，主要用于 `pi0` / `smolvla`
+- `--instruction`：语言指令，主要用于 `pi0` / `pi05` / `smolvla`
 - `--execution-mode`：`auto` / `raw` / `step`
 - `--temporal-ensemble`：对重叠 chunk 动作做指数加权融合
 - `--temporal-ensemble-coeff`：时间集成系数，默认 `0.01`，必须和 `--temporal-ensemble` 一起使用

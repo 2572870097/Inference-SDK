@@ -12,7 +12,7 @@ from typing import Dict
 
 import numpy as np
 
-from inference_sdk import AsyncInferenceConfig, get_global_async_runtime
+from inference_sdk import AsyncInferenceConfig, SUPPORTED_MODEL_TYPES, get_global_async_runtime
 
 
 def read_camera_images() -> Dict[str, np.ndarray]:
@@ -37,7 +37,7 @@ def sleep_until_next_tick(start_time: float, fps: float) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run an async inference control-loop template.")
-    parser.add_argument("--model-type", required=True, choices=["act", "smolvla", "pi0"])
+    parser.add_argument("--model-type", required=True, choices=SUPPORTED_MODEL_TYPES)
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--instruction", default=None)
