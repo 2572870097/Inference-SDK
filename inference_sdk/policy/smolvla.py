@@ -25,6 +25,7 @@ import yaml
 from ..base import BaseInferenceEngine, SmoothingConfig
 from ..device import resolve_torch_device
 from ..runtime import format_optional_dependency_error, iter_model_search_roots, iter_unique_paths
+from .gripper_scale import feature_gripper_stats_are_unit_scaled
 from .rtc import make_rtc_config, make_rtc_processor
 
 logger = logging.getLogger(__name__)
@@ -320,6 +321,8 @@ class SmolVLAInferenceEngine(BaseInferenceEngine):
         self.config: Optional[Any] = None
         self.config_dict: Optional[Dict] = None
         self.stats: Optional[Dict] = None
+        self._state_gripper_stats_unit_scaled = True
+        self._action_gripper_stats_unit_scaled = True
         self.tokenizer: Optional[Any] = None
         
         # Camera role mapping
@@ -401,6 +404,15 @@ class SmolVLAInferenceEngine(BaseInferenceEngine):
 
                 self.config_dict = _convert_pretrained_smolvla_config(pretrained_config)
                 self.stats = _load_pretrained_smolvla_stats(checkpoint_path)
+
+            self._state_gripper_stats_unit_scaled = feature_gripper_stats_are_unit_scaled(
+                self.stats,
+                "observation.state",
+            )
+            self._action_gripper_stats_unit_scaled = feature_gripper_stats_are_unit_scaled(
+                self.stats,
+                "action",
+            )
 
             self._apply_action_chunk_overrides(self.config_dict)
             
@@ -499,6 +511,11 @@ class SmolVLAInferenceEngine(BaseInferenceEngine):
             logger.info(f"State dim: {self.state_dim}, Action dim: {self.action_dim}")
             logger.info(f"Chunk size: {self.chunk_size}, N action steps: {self.n_action_steps}")
             logger.info(f"VLM: {vlm_model_source}")
+            logger.info(
+                "SmolVLA gripper stats scale: state=%s action=%s",
+                "[0,1]" if self._state_gripper_stats_unit_scaled else "robot-space",
+                "[0,1]" if self._action_gripper_stats_unit_scaled else "robot-space",
+            )
             
             self.is_loaded = True
             
@@ -651,8 +668,8 @@ class SmolVLAInferenceEngine(BaseInferenceEngine):
         """
         state = state.copy()
         
-        # Scale gripper from [0, 1000] to [0, 1]
-        if len(state) >= 7:
+        # Scale gripper to [0, 1] when checkpoint stats are unit-scaled.
+        if len(state) >= 7 and self._state_gripper_stats_unit_scaled:
             state[-1] = state[-1] / 1000.0
         
         state_tensor = torch.from_numpy(state).float()
@@ -687,8 +704,8 @@ class SmolVLAInferenceEngine(BaseInferenceEngine):
         
         action = action.numpy()
         
-        # Scale gripper from [0, 1] to [0, 1000]
-        if len(action) >= 7:
+        # Return robot-space gripper values when checkpoint stats are unit-scaled.
+        if len(action) >= 7 and self._action_gripper_stats_unit_scaled:
             action[-1] = action[-1] * 1000.0
         
         return action

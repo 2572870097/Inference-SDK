@@ -39,7 +39,8 @@ uv pip install -e ".[all,examples]"
 - `images` 使用相机角色名作为 key，例如 `head`、`wrist`；可用角色以 `metadata.required_cameras` 为准。
 - 每张图像应是 BGR 格式的 `numpy.ndarray`，形状为 `(H, W, 3)`。
 - `state` 应是一维 `numpy.ndarray`，维度需要和模型 `observation.state` 一致。
-- 当前 ACT、SmolVLA、PI0、PI0.5 engine 默认按 robot-space 处理夹爪，输入/输出最后一维夹爪通常是 `[0, 1000]`。
+- 当前 ACT、SmolVLA、PI0、PI0.5 engine 对 SDK 调用方仍按 robot-space 处理夹爪，输入/输出最后一维夹爪通常是 `[0, 1000]`。
+- 加载 checkpoint 后，engine 会根据 `observation.state` / `action` 的最后一维 stats 自动判断模型内部夹爪是 `[0, 1]` 还是 robot-space，并只在需要时做 `/1000` 或 `*1000` 转换。
 - LeRobot dataset 里的夹爪如果是归一化 `[0, 1]`，验证脚本会通过 `--dataset-gripper-scale auto` 自动适配。
 
 ## 同步推理
